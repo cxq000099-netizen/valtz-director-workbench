@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="director-key" content="__DIRECTOR_KEY__">
+  <title>Valtz 导演操作台 V0.2</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <div class="brand"><span class="mark" aria-hidden="true">▷</span><div><h1>Valtz 导演操作台</h1><small>本机工作室 · V0.2</small></div></div>
+    <div class="row"><span id="connection" class="subtle" role="status">正在读取本机能力</span><button id="refresh" type="button" title="重新读取当前安装的 Valtz 版本、模型和档位。">刷新模型</button><button id="model-button" type="button">提示词模型</button><button id="monitor-button" type="button">任务进度</button></div>
+  </header>
+  <div class="shell">
+    <nav aria-label="制作步骤">
+      <label class="field">当前项目<select id="project" aria-label="切换项目"></select></label>
+      <form id="new-project" class="new-project"><input id="project-title" placeholder="新项目名称" aria-label="新项目名称" maxlength="90" required><button type="submit">新建</button></form>
+      <div id="steps">
+        <button data-page="script" aria-current="page">剧本与分镜</button>
+        <button data-page="cast">人物定妆</button>
+        <button data-page="shot">镜头工作台</button>
+        <button data-page="export">选片与导出</button>
+      </div>
+    </nav>
+    <main>
+      <div class="row between breadcrumb">
+        <span id="project-name" class="subtle">尚未打开项目</span>
+        <button id="save" type="button">保存项目</button>
+      </div>
+      <div id="message" role="status" hidden></div>
+      <section id="work"></section>
+      <details id="activity" hidden><summary>任务记录</summary><div id="job-list"></div></details>
+    </main>
+  </div>
+  <aside id="monitor" class="monitor" aria-label="任务进度" hidden>
+    <div class="row between">
+      <strong>任务进度</strong>
+      <div class="row monitor-controls">
+        <button type="button" id="pin-monitor" title="在支持的浏览器中打开跨标签页置顶小窗。" hidden>置顶小窗</button>
+        <button type="button" id="collapse-monitor">收起</button>
+      </div>
+    </div>
+    <div id="monitor-body" class="monitor-body" aria-live="polite"></div>
+  </aside>
+  <dialog id="model-dialog">
+    <form id="model-form">
+      <div class="row between"><h2>提示词模型</h2><button type="button" id="model-close">关闭</button></div>
+      <label class="field">连接方式
+        <select id="model-mode"><option value="splash">Splash · 本地默认</option><option value="custom">OpenAI 兼容 API</option></select>
+      </label>
+      <div id="model-fields" hidden>
+        <label class="field">API 基础地址<input id="model-url" type="url" placeholder="https://example.com/v1" title="支持 HTTPS 服务和本机 HTTP 服务。填写基础地址，不加 /chat/completions。"></label>
+        <label class="field">模型 ID<input id="model-id" maxlength="200" placeholder="服务商提供的模型 ID"></label>
+        <label class="field">API Key<input id="model-key" type="password" autocomplete="off" spellcheck="false" title="密钥只保留在当前工作台服务的内存里。"></label>
+        <label class="check"><input id="model-clear-key" type="checkbox">清除已有密钥</label>
+        <p class="note">启用后，点击拆分或起草时会将相应文字交给所选 API。图片和视频仍由本机 Valtz 生成。重启工作台后回到 Splash。</p>
+      </div>
+      <p id="model-status" class="note" role="status"></p>
+      <div class="row model-actions"><button id="model-test" type="button" title="仅请求模型列表，不发送剧本或提示词。">测试连接</button><button type="submit" class="primary">使用这个模型</button></div>
+    </form>
+  </dialog>
+</body>
+</html>
