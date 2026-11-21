@@ -91,3 +91,20 @@ dialog::backdrop { background: #19261d88; }
   main { padding: 18px 14px 25px; }
   .tools,.grid { grid-template-columns: 1fr; }
 }
+
+#mtv-track-player { width: 100%; max-width: 620px; margin-top: 8px; }
+.mtv-person,.mtv-shot { margin: 8px 0; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; }
+.mtv-person > article { margin: 10px 0 0; }
+.mtv-shot > p,.mtv-shot > button { margin-top: 8px; }
+.mtv-treatment { margin: 12px 0; line-height: 1.75; }
+.mode-switch { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px; background: var(--base); border-radius: 10px; }
+.mode-switch[hidden] { display: none; }
+.mode-switch button { border-color: transparent; background: transparent; font-size: 13px; white-space: nowrap; }
+.mode-switch button[aria-pressed="true"] { border-color: var(--line); background: var(--paper); color: var(--accent); font-weight: 600; }
+.swap-source { display: block; width: 100%; max-width: 720px; max-height: 450px; background: #141a16; border-radius: 8px; }
+.swap-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(255px, 1fr)); gap: 12px; margin-top: 13px; }
+.swap-person { border: 1px solid var(--line); border-radius: 9px; padding: 12px; }
+.swap-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 9px 0; }
+.swap-pair img,.swap-placeholder { display: grid; place-items: center; width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 6px; background: var(--soft); }
+.swap-pair figcaption { margin-top: 5px; }
+@media(max-width: 1080px) { .top { flex-wrap: wrap; } }

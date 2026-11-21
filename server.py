@@ -20,6 +20,8 @@ import zipfile
 from pathlib import Path
 
 import engine
+import face_swap
+import mtv
 import providers
 import storage
 
@@ -28,6 +30,18 @@ ID = re.compile(r"[a-f0-9]{24}")
 MEDIA = re.compile(r"[a-f0-9]{24}\.(?:png|jpg|mp4)")
 DOCUMENT_LIMIT = 12 * 1024 * 1024
 APP_TITLE = "Valtz 导演操作台"
+PROJECT_MODES = ("drama", "mtv", "swap")
+FACE_JOBS = ("face-scan", "face-replace", "face-export")
+TRACKED_JOBS = ("breakdown", "mtv-plan", "rewrite", "cast-image", "first-image", "video", "export") + FACE_JOBS
+
+
+def project_mode(doc):
+    if doc.get("mode") in PROJECT_MODES:
+        return doc["mode"]
+    if ((doc.get("mtv") or {}).get("track_id") and not doc.get("script")
+            and all(shot.get("mtv") for shot in doc.get("shots", []))):
+        return "mtv"
+    return "drama"
 
 
 def uid():
@@ -111,17 +125,21 @@ class Workbench:
     def list_projects(self):
         self.check_drive()
         projects = [read_json(p) for p in self.root.glob("*/project.json")]
-        return [{"id": p["id"], "name": p["name"]} for p in reversed(sorted(projects, key=lambda p: p["updated"]))]
+        return [{"id": p["id"], "name": p["name"], "mode": project_mode(p)}
+                for p in reversed(sorted(projects, key=lambda p: p["updated"]))]
 
-    def create(self, title):
+    def create(self, title, mode="drama"):
         self.check_drive()
         title = text(title, "项目名", 90, required=True)
+        if mode not in PROJECT_MODES:
+            raise ValueError("请选择一个制作模式。")
         key = uid()
         folder = self.root / key
         folder.mkdir()
         (folder / "jobs").mkdir()
         (folder / "media").mkdir()
-        doc = {"id": key, "name": title, "script": "", "cast": [], "shots": [], "updated": self.now(), "revision": 0}
+        doc = {"id": key, "name": title, "mode": mode, "script": "", "cast": [], "shots": [],
+               "updated": self.now(), "revision": 0}
         save_json(folder / "project.json", doc)
         return doc
 
@@ -136,6 +154,7 @@ class Workbench:
                 raise ValueError("此项目已在另一窗口修改，请重新打开项目后编辑。")
             cleaned = {
                 "id": current["id"], "name": text(body["name"], "项目名", 90, True),
+                "mode": project_mode(current),
                 "script": text(body["script"], "剧本", 70000),
                 "cast": [], "shots": [], "updated": self.now(), "revision": current["revision"] + 1,
                 "breakdown": text(body.get("breakdown") or "", "草稿编号", 24),
@@ -147,7 +166,13 @@ class Workbench:
                     if not isinstance(item, dict) or not ID.fullmatch(item.get("id", "")):
                         raise ValueError("无效的分镜编号。")
                     self.validate_selection(path, item)
+                    if collection == "shots" and "mtv" in item:
+                        self.mtv_shot(path, item["mtv"])
                     cleaned[collection].append(item)
+            if body.get("mtv") is not None:
+                cleaned["mtv"] = self.mtv_settings(path, body["mtv"], cleaned["cast"])
+            if cleaned["mode"] == "swap":
+                cleaned["swap"] = self.swap_settings(path, body.get("swap") or {})
             save_json(path / "project.json", cleaned)
             return cleaned
 
@@ -195,21 +220,136 @@ class Workbench:
     def jobs(self, path):
         return sorted((read_json(p) for p in (path / "jobs").glob("*.json")), key=lambda job: (job["created"], job["id"]))
 
+    def swap_source(self, path, key):
+        if not ID.fullmatch(key or ""):
+            raise ValueError("请先上传换脸视频。")
+        record = path / "face-media" / (key + ".json")
+        if not record.is_file():
+            raise ValueError("未找到原视频。")
+        return read_json(record)
+
+    def upload_swap_video(self, path, name, stream, length):
+        self.require_mode(path, "swap")
+        key = uid()
+        folder = path / "face-media"
+        record = face_swap.import_video(folder, key, name, stream, length)
+        self.check_drive()
+        save_json(folder / (key + ".json"), record)
+        return record
+
+    def require_mode(self, path, mode):
+        if project_mode(read_json(path / "project.json")) != mode:
+            raise ValueError("请先打开对应制作模式的项目。")
+
+    def job_record(self, path, job_id, kind):
+        if not ID.fullmatch(job_id or ""):
+            raise ValueError("任务编号无效。")
+        file = path / "jobs" / (job_id + ".json")
+        if not file.is_file():
+            raise ValueError("找不到相关任务。")
+        result = read_json(file)
+        if result["kind"] != kind or result["status"] != "done":
+            raise ValueError("相关任务还没有成功完成。")
+        return result
+
+    def swap_settings(self, path, settings):
+        video = text(settings.get("video", ""), "视频编号", 24)
+        scan = text(settings.get("scan", ""), "识别任务编号", 24)
+        mappings = settings.get("mappings", {})
+        if video:
+            self.swap_source(path, video)
+        if scan:
+            result = self.job_record(path, scan, "face-scan")["result"]
+            if result["video_id"] != video:
+                raise ValueError("识别结果与当前视频不一致。")
+            faces = {face["id"] for face in result["faces"]}
+            if not isinstance(mappings, dict) or not set(mappings).issubset(faces):
+                raise ValueError("参考图必须对应到当前视频的人脸。")
+            for file in mappings.values():
+                self.image(path, file)
+        elif mappings:
+            raise ValueError("请先识别人脸。")
+        return {"video": video, "scan": scan, "mappings": mappings}
+
+    def upload_swap_reference(self, path, data):
+        self.require_mode(path, "swap")
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            suffix = ".png"
+        elif data.startswith(b"\xff\xd8\xff"):
+            suffix = ".jpg"
+        else:
+            raise ValueError("请上传单人 PNG 或 JPEG 参考图。")
+        name = uid() + suffix
+        (path / "media" / name).write_bytes(data)
+        return {"file": name}
+
+    def track(self, path, key):
+        if not mtv.TRACK_ID.fullmatch(key or ""):
+            raise ValueError("音轨编号无效。")
+        metadata = path / "tracks" / (key + ".json")
+        if not metadata.is_file():
+            raise ValueError("找不到所选音轨，请重新导入。")
+        return read_json(metadata)
+
+    def upload_track(self, path, name, stream, length):
+        key = uid()
+        folder = path / "tracks"
+        record = mtv.import_audio(folder, key, name, stream, length)
+        self.check_drive()
+        save_json(folder / (key + ".json"), record)
+        return record
+
+    def mtv_settings(self, path, settings, cast):
+        if not isinstance(settings, dict):
+            raise ValueError("MTV 项目设置无效。")
+        style = settings.get("style", "cinematic")
+        treatment = settings.get("treatment", "narrative")
+        if style not in mtv.STYLE or treatment not in mtv.TREATMENTS:
+            raise ValueError("请选择已有的 MTV 形式和风格。")
+        count = settings.get("count", 1)
+        ids = settings.get("cast_ids", [])
+        available = {person["id"] for person in cast}
+        if (type(count) is not int or not 0 <= count <= 5 or not isinstance(ids, list) or len(ids) > count
+                or any(not isinstance(key, str) or key not in available for key in ids)
+                or len(set(ids)) != len(ids)):
+            raise ValueError("请确认 MTV 人物名单，人数为 0–5 人。")
+        track_id = text(settings.get("track_id", ""), "音轨编号", 24)
+        if track_id:
+            self.track(path, track_id)
+        return {"style": style, "treatment": treatment, "count": count, "cast_ids": ids,
+                "track_id": track_id, "lyrics": text(settings.get("lyrics", ""), "歌词", 30000),
+                "direction": text(settings.get("direction", ""), "导演要求", 3000),
+                "cues": text(settings.get("cues", ""), "时间锚点", 10000),
+                "adopted_plan": text(settings.get("adopted_plan", ""), "草稿编号", 24)}
+
+    def mtv_shot(self, path, data):
+        track = self.track(path, data["track_id"])
+        start, stop = data["start_ms"], data["end_ms"]
+        if (type(start) is not int or type(stop) is not int
+                or not 0 <= start < stop <= round(track["duration"] * 1000)):
+            raise ValueError("MTV 镜头的原音时间超出音轨范围。")
+        return track
+
     def start(self, path, body):
         if not self.busy.acquire(blocking=False):
             raise ValueError("请等待工作台当前任务完成。")
         try:
             kind = body.get("kind")
-            if kind not in ("breakdown", "rewrite", "cast-image", "first-image", "video", "export"):
+            if kind not in TRACKED_JOBS:
                 raise ValueError("无效任务。")
             doc = read_json(path / "project.json")
+            mode = project_mode(doc)
+            if (kind in FACE_JOBS) != (mode == "swap") or (kind == "mtv-plan" and mode != "mtv") or (kind == "breakdown" and mode != "drama"):
+                raise ValueError("当前项目模式不支持这个任务。")
             group = "cast" if kind == "cast-image" else "shots"
             owner = body.get("owner", "")
-            if kind not in ("breakdown", "export") and not any(x["id"] == owner for x in doc[group]):
+            if kind not in ("breakdown", "mtv-plan", "export", *FACE_JOBS) and not any(x["id"] == owner for x in doc[group]):
                 raise ValueError("找不到本次任务对应的人物或镜头。")
+            if kind in FACE_JOBS:
+                owner = doc.get("swap", {}).get("video", "")
             key = uid()
             job = {"id": key, "owner": owner, "kind": kind, "status": "running", "created": self.now()}
-            if kind in ("breakdown", "rewrite"):
+            if kind in ("breakdown", "mtv-plan", "rewrite"):
                 job["text_model"] = self.profile["model"]
             save_json(path / "jobs" / (key + ".json"), job)
             self.last_job = (path, key)
@@ -237,8 +377,36 @@ class Workbench:
     def execute(self, path, job, data, doc, profile):
         self.check_drive()
         kind = job["kind"]
+        if kind in FACE_JOBS:
+            options = self.swap_settings(path, doc.get("swap") or {})
+            video = self.swap_source(path, options["video"])
+            if kind == "face-export":
+                result = self.job_record(path, data.get("result_id"), "face-replace")["result"]
+                if result["preview"] or result["video_id"] != video["id"]:
+                    raise ValueError("请先完成当前视频的整片换脸。")
+                src = self.media(path, result["file"])
+                folder = Path.home() / "Downloads" / "Valtz 导演操作台" / safe_name(doc["name"])
+                folder.mkdir(parents=True, exist_ok=True)
+                destination = folder / (safe_name(Path(video["name"]).stem) + "_换脸_" + job["id"][:8] + ".mp4")
+                with src.open("rb") as incoming, destination.open("xb") as outgoing:
+                    shutil.copyfileobj(incoming, outgoing)
+                return {"file": str(destination)}
+            source = path / "face-media" / video["file"]
+            if kind == "face-scan":
+                return face_swap.run(self.root, path, job, source, video)
+            if not options["mappings"]:
+                raise ValueError("请为至少一个识别出的人脸选择参考图。")
+            refs = {key: self.image(path, value) for key, value in options["mappings"].items()}
+            return face_swap.run(self.root, path, job, source, video, options["scan"], refs, bool(data.get("preview")))
         if kind == "breakdown":
             return engine.script_breakdown(text(doc["script"], "剧本", 70000, True), profile)
+        if kind == "mtv-plan":
+            settings = self.mtv_settings(path, doc.get("mtv", {}), doc["cast"])
+            track = self.track(path, settings["track_id"])
+            cast = [person for person in doc["cast"] if person["id"] in settings["cast_ids"]]
+            if len(cast) != settings["count"] or any(not person.get("adopted") for person in cast):
+                raise ValueError("先为选定人数采用定妆图，或选择 0 人的意象 MTV。")
+            return mtv.draft(settings, track, cast, profile)
         if kind == "export":
             return self.export(path, job, doc, data.get("format"))
         data["prompt"] = text(data.get("prompt"), "提示词", required=True)
@@ -277,11 +445,18 @@ class Workbench:
                   if j["kind"] == "video" and j["status"] == "done"}
         if any(shot["selected"] not in assets for _, shot in chosen):
             raise ValueError("有选片缺少对应的 Valtz 素材。")
+        tracks = {}
+        for _, shot in chosen:
+            if shot.get("mtv"):
+                track = self.mtv_shot(path, shot["mtv"])
+                tracks[track["id"]] = track
         output_root = Path.home() / "Downloads" / "Valtz 导演操作台" / safe_name(doc["name"])
         output = output_root / (datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + job["id"][:6])
         output.mkdir(parents=True)
         env = engine.runtime_env(self.root) if fmt != "h264" else None
         files = []
+        placements = []
+        masters = {}
         with (engine.gpu_gate() if fmt != "h264" else contextlib.nullcontext()):
             for index, shot in chosen:
                 selected = shot["selected"]
@@ -294,7 +469,18 @@ class Workbench:
                                    env, path / "jobs" / (job["id"] + ".log"))
                 engine.verify_media(file, "video")
                 files.append(filename)
-        save_json(output / "镜头清单.json", {"project": doc["name"], "files": files})
+                if shot.get("mtv"):
+                    placement = shot["mtv"]
+                    placements.append({"file": filename, "song": placement["track_id"],
+                                       "start_ms": placement["start_ms"], "end_ms": placement["end_ms"]})
+        for number, (key, track) in enumerate(tracks.items(), 1):
+            name = f"歌曲原音_{number:02d}_{safe_name(Path(track['name']).stem)}.wav"
+            shutil.copyfile(path / "tracks" / track["preview"], output / name)
+            masters[key] = name
+        manifest = {"project": doc["name"], "files": files}
+        if placements:
+            manifest.update(mtv_placements=placements, song_audio=masters)
+        save_json(output / "镜头清单.json", manifest)
         return {"directory": str(output), "files": files}
 
     def recover(self):
@@ -305,7 +491,7 @@ class Workbench:
                 job["status"] = "failed"
                 job["error"] = "上次服务已关闭。请看任务记录或确认现有素材，系统没有自动重做。"
                 save_json(file, job)
-            if job["kind"] in ("breakdown", "rewrite", "cast-image", "first-image", "video", "export"):
+            if job["kind"] in TRACKED_JOBS:
                 self.last_job = (file.parent.parent, job["id"])
 
     def task_status(self):
@@ -381,27 +567,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.headers.get("Host") != self.server.host_header:
             self.json({"error": "此工作台仅接受本机地址。"}, 403)
             return
-        if writing and not secrets.compare_digest(self.headers.get("X-Director-Key", ""), app.token):
-            self.json({"error": "请刷新工作台页面。"}, 403)
-            return
+        if writing:
+            key = self.headers.get("X-Director-Key", "")
+            key_valid = secrets.compare_digest(key, app.token)
+            # In a tab kept open across a local restart, the old key is stale.
+            # Permit the browser's verified same-origin POST, still requiring
+            # the workbench header. Cross-origin and opaque origins stay blocked.
+            same_tab = (
+                re.fullmatch(r"[A-Za-z0-9_-]{43}", key)
+                and self.headers.get("Sec-Fetch-Site") == "same-origin"
+                and self.headers.get("Origin") == "http://" + self.server.host_header
+            )
+            if not key_valid and not same_tab:
+                self.json({"error": "请刷新工作台页面。"}, 403)
+                return
         url = urllib.parse.urlsplit(self.path)
         parts = url.path.strip("/").split("/")
-        if not writing and url.path in ("/", "/app.js", "/app.css"):
-            file = BASE / ({"/": "index.html", "/app.js": "app.js", "/app.css": "app.css"}[url.path])
+        if not writing and url.path in ("/", "/app.js", "/mtv.js", "/face.js", "/app.css"):
+            file = BASE / ("index.html" if url.path == "/" else url.path[1:])
             data = file.read_bytes()
             if url.path == "/":
                 data = data.replace(b"__DIRECTOR_KEY__", app.token.encode("ascii"))
             self.reply(data, (mimetypes.guess_type(file.name)[0] or "text/html") + "; charset=utf-8")
             return
         if parts == ["api", "capabilities"] and not writing:
-            caps = engine.catalog()
+            caps, native, profiles, valtz_error = {}, None, {}, ""
+            try:
+                caps = engine.catalog()
+                native = storage.app_version()
+                profiles = engine.video_profiles(caps)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                valtz_error = "Valtz 或其模型盘未就绪。"
             try:
                 default = providers.connection({})
                 splash = default["model"] in providers.model_ids(default)
             except (OSError, ValueError, KeyError, AttributeError):
                 splash = False
-            self.json({"valtz": caps, "native": storage.app_version(), "profiles": engine.video_profiles(caps),
-                       "sizes": engine.SIZES, "splash": splash})
+            self.json({"valtz": caps, "native": native, "profiles": profiles, "valtz_error": valtz_error,
+                       "sizes": engine.SIZES, "splash": splash, "modes": list(PROJECT_MODES),
+                       "face_swap": face_swap.available(app.root)})
             return
         if parts == ["api", "task-status"] and not writing:
             self.json(app.task_status())
@@ -420,14 +624,53 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.json({"count": len(ids), "matched": settings["model"] in ids})
             return
         if parts == ["api", "projects"]:
-            self.json(app.create(self.body()["name"]) if writing else app.list_projects())
+            if writing:
+                request = self.body()
+                self.json(app.create(request["name"], request.get("mode", "drama")))
+            else:
+                self.json(app.list_projects())
             return
         if len(parts) >= 3 and parts[:2] == ["api", "projects"]:
             project = app.project(parts[2])
             if len(parts) == 3:
-                self.json(app.save(project, self.body()) if writing else read_json(project / "project.json"))
+                if writing:
+                    self.json(app.save(project, self.body()))
+                else:
+                    doc = read_json(project / "project.json")
+                    self.json({**doc, "mode": project_mode(doc)})
                 return
             action = parts[3]
+            if action == "mtv-audio":
+                app.require_mode(project, "mtv")
+                if writing and len(parts) == 4:
+                    name = urllib.parse.parse_qs(url.query).get("filename", [""])[0]
+                    self.json(app.upload_track(project, name, self.rfile, int(self.headers.get("Content-Length", "0"))))
+                    return
+                if not writing and len(parts) in (5, 6):
+                    track = app.track(project, parts[4])
+                    if len(parts) == 5:
+                        self.json(track)
+                        return
+                    if parts[5] == "preview":
+                        self.send_media(project / "tracks" / track["preview"])
+                        return
+            if action == "swap-video":
+                app.require_mode(project, "swap")
+                if writing and len(parts) == 4:
+                    name = urllib.parse.parse_qs(url.query).get("filename", [""])[0]
+                    self.json(app.upload_swap_video(project, name, self.rfile, int(self.headers.get("Content-Length", "0"))))
+                    return
+                if not writing and len(parts) in (5, 6):
+                    source = app.swap_source(project, parts[4])
+                    if len(parts) == 5:
+                        self.json(source)
+                        return
+                    if parts[5] == "preview":
+                        self.send_media(project / "face-media" / source["file"])
+                        return
+            if action == "swap-reference" and writing and len(parts) == 4:
+                self.json(app.upload_swap_reference(project, self.raw_body()))
+                return
             if action == "jobs" and len(parts) == 4:
                 self.json(app.start(project, self.body()) if writing else app.jobs(project))
                 return
@@ -501,7 +744,6 @@ def main():
     parser.add_argument("--no-open", action="store_true")
     args = parser.parse_args()
     root = storage.data_root()
-    storage.model_root()
     root.mkdir(parents=True, exist_ok=True)
     address = f"http://127.0.0.1:{args.port}/"
     with (root / ".service.lock").open("a") as lock:
@@ -516,7 +758,7 @@ def main():
         with http.server.ThreadingHTTPServer(("127.0.0.1", args.port), Handler) as service:
             service.app = app
             service.host_header = f"127.0.0.1:{args.port}"
-            print(f"{APP_TITLE} V0.2  {address}", flush=True)
+            print(f"{APP_TITLE} V0.3  {address}", flush=True)
             if not args.no_open:
                 webbrowser.open(address)
             with contextlib.suppress(KeyboardInterrupt):

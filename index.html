@@ -4,13 +4,20 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="director-key" content="__DIRECTOR_KEY__">
-  <title>Valtz 导演操作台 V0.2</title>
+  <title>Valtz 导演操作台 V0.3</title>
   <link rel="stylesheet" href="/app.css">
   <script src="/app.js" defer></script>
+  <script src="/mtv.js" defer></script>
+  <script src="/face.js" defer></script>
 </head>
 <body>
   <header class="top">
-    <div class="brand"><span class="mark" aria-hidden="true">▷</span><div><h1>Valtz 导演操作台</h1><small>本机工作室 · V0.2</small></div></div>
+    <div class="brand"><span class="mark" aria-hidden="true">▷</span><div><h1>Valtz 导演操作台</h1><small>本机工作室 · V0.3</small></div></div>
+    <div class="mode-switch" id="mode-switch" aria-label="制作模式" hidden>
+      <button type="button" data-mode-switch="drama" aria-pressed="true">AI 剧</button>
+      <button type="button" data-mode-switch="mtv" aria-pressed="false">AI-MTV</button>
+      <button type="button" data-mode-switch="swap" aria-pressed="false">AI 换脸视频</button>
+    </div>
     <div class="row"><span id="connection" class="subtle" role="status">正在读取本机能力</span><button id="refresh" type="button" title="重新读取当前安装的 Valtz 版本、模型和档位。">刷新模型</button><button id="model-button" type="button">提示词模型</button><button id="monitor-button" type="button">任务进度</button></div>
   </header>
   <div class="shell">
@@ -18,10 +25,12 @@
       <label class="field">当前项目<select id="project" aria-label="切换项目"></select></label>
       <form id="new-project" class="new-project"><input id="project-title" placeholder="新项目名称" aria-label="新项目名称" maxlength="90" required><button type="submit">新建</button></form>
       <div id="steps">
-        <button data-page="script" aria-current="page">剧本与分镜</button>
-        <button data-page="cast">人物定妆</button>
-        <button data-page="shot">镜头工作台</button>
-        <button data-page="export">选片与导出</button>
+        <button data-page="script" data-modes="drama" aria-current="page">剧本与分镜</button>
+        <button data-page="mtv" data-modes="mtv" hidden>歌曲与分镜</button>
+        <button data-page="cast" data-modes="drama mtv">人物定妆</button>
+        <button data-page="shot" data-modes="drama mtv">镜头工作台</button>
+        <button data-page="export" data-modes="drama mtv">选片与导出</button>
+        <button data-page="swap" data-modes="swap" hidden>识别、换脸与导出</button>
       </div>
     </nav>
     <main>
@@ -38,6 +47,7 @@
     <div class="row between">
       <strong>任务进度</strong>
       <div class="row monitor-controls">
+        <button type="button" id="sound-monitor" aria-pressed="true" title="任务成功后播放提示音。浏览器需要先与页面交互一次。">提示音开</button>
         <button type="button" id="pin-monitor" title="在支持的浏览器中打开跨标签页置顶小窗。" hidden>置顶小窗</button>
         <button type="button" id="collapse-monitor">收起</button>
       </div>

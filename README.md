@@ -2,17 +2,19 @@
 
 A local macOS workbench for directing individual AI video shots with Valtz. Start with a script, choose the cast and opening frames, generate a few takes, and export the clips you want to edit in DaVinci Resolve.
 
-**Version 0.2** · Chinese interface · English documentation
+**Version 0.3** · Chinese interface · English documentation
 
 ## Screenshots
 
-These screenshots show the workbench with a fictional demo project and illustrative progress.
+These V0.2 screenshots show the storyboard editor, shot settings, and progress panel using a fictional demo project. V0.3 adds the mode switcher at the top.
 
 | Storyboard and progress | Shot settings | Text model connection |
 | --- | --- | --- |
 | [![Editable storyboard and floating status](docs/storyboard.jpg)](docs/storyboard.jpg) | [![Per-shot generation settings](docs/shot-workbench.jpg)](docs/shot-workbench.jpg) | [![OpenAI-compatible API settings](docs/model-connection.jpg)](docs/model-connection.jpg) |
 
 ## What you can do
+
+Choose **AI 剧**, **AI-MTV**, or **AI 换脸视频** at the top. Each mode has its own projects and workspace.
 
 - **Turn a script into a shot list.** Import TXT or DOCX, or paste a script. Review the proposed cast and shots before adding them. Edit the action brief, opening-frame prompt, and video prompt for each shot.
 - **Build a reusable cast.** Upload a JPEG or PNG likeness reference, or generate portrait candidates with one of the installed Valtz image models. Choose the look you want to reuse.
@@ -35,6 +37,31 @@ These screenshots show the workbench with a fictional demo project and illustrat
 
 Open [127.0.0.1:8776](http://127.0.0.1:8776/) if the browser does not open automatically. The service listens on loopback. The app reads Valtz's installed capabilities at launch and when you click **Refresh models**.
 
+### Music video mode
+
+Choose **AI-MTV** at the top and create a project. Import WAV or extract the first audio track from MP4. Add plain lyrics or LRC lyrics with timecodes, select up to five approved cast looks, and choose a treatment and visual style. Listen to the source audio and mark musical changes as optional cut anchors. The workbench computes shot windows from the measured audio length. The text model drafts the treatment and storyboard from the lyrics and planning data. The audio and cast images stay on your computer.
+
+Add the approved draft to the shot workspace to generate and choose takes. Each shot keeps its source audio interval. Export includes a separate WAV master and a placement manifest for Resolve. Beat detection and lip synchronization are not automatic in this version.
+
+The progress panel can play a two-note chime when a job succeeds. Interact with the page at least once so your browser can enable audio. Use the sound button to turn it off.
+
+### Video face replacement
+
+Create an **AI 换脸视频** project and import an MP4 or MOV. Run recognition, inspect the face group thumbnails, and assign one single-person JPEG or PNG reference to each group you want to change. Leave a group unassigned to keep its original face. Try the short preview before processing the full video, then save the accepted output to Downloads.
+
+The worker uses a local InsightFace detector, identity embeddings, and a face replacement model on the CPU. It skips uncertain matches and reuses source audio. Crowded shots, occlusion, and strong profile views may need manual review.
+
+To set up this mode on another Mac, use a separate Python 3.12 environment and install the worker dependencies. Make sure FFmpeg and ffprobe are available.
+
+```sh
+python3.12 -m venv ~/.venvs/valtz-director-face
+~/.venvs/valtz-director-face/bin/python -m pip install 'insightface==1.0.1' onnxruntime
+export VALTZ_DIRECTOR_FACE_PYTHON="$HOME/.venvs/valtz-director-face/bin/python"
+python3 server.py
+```
+
+Use compatible model files you already have in `VALTZ_DIRECTOR_FACE_MODELS` (defaults to `~/.insightface/models`). The expected layout contains `buffalo_l/det_10g.onnx`, `buffalo_l/w600k_r50.onnx`, and `inswapper_128.onnx`. Model files are not included or downloaded by the workbench.
+
 ### Text model connections
 
 The default is a running Splash OpenAI-compatible API at `http://127.0.0.1:8000/v1`, using `local/qwen3.8-27b`. In the workbench, open **Prompt model** and enter the base URL, model ID, and optional API key for another compatible service. The **Test connection** button reads the model list. Providers that do not implement that list may still support chat completions.
@@ -55,5 +82,8 @@ Projects and generated candidates default to `~/Library/Application Support/Valt
 | `VALTZ_DIRECTOR_SPLASH_URL`, `VALTZ_DIRECTOR_SPLASH_MODEL` | Default local Splash connection |
 | `VALTZ_DIRECTOR_H3_SKILL` | Directory containing the official H3 prompt-writing skill |
 | `VALTZ_DIRECTOR_FFPROBE` | Path to the media inspection executable |
+| `VALTZ_DIRECTOR_FFMPEG` | Path to FFmpeg, needed to import music-video audio |
+| `VALTZ_DIRECTOR_FACE_PYTHON` | Python with InsightFace, ONNX Runtime, and OpenCV installed |
+| `VALTZ_DIRECTOR_FACE_MODELS` | Local folder with detector, recognizer, and replacement weights |
 
 This is an independent workbench for an existing Valtz installation. Generation is serialized within the workbench. The exact installed models, profiles, and native operations available may vary with the Valtz build.

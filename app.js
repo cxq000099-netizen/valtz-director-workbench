@@ -3,13 +3,16 @@
 const $ = id => document.getElementById(id);
 const token = document.querySelector('meta[name="director-key"]').content;
 const jobNames = {
-  breakdown: "剧本拆分", rewrite: "H3 提示词", "cast-image": "定妆", "first-image": "首帧",
+  breakdown: "剧本拆分", "mtv-plan": "MTV 剧本与分镜", rewrite: "H3 提示词", "cast-image": "定妆", "first-image": "首帧",
   video: "镜头视频", export: "导出", "cast-source": "造型参考", "first-upload": "上传首帧", "last-upload": "上传尾帧",
+  "face-scan": "识别人脸", "face-replace": "换脸视频", "face-export": "导出换脸视频",
 };
+const modeHome = {drama: "script", mtv: "mtv", swap: "swap"};
 const state = {
   project: null, projects: [], jobs: [], page: "script", shotId: null, dirty: false,
   busy: false, capabilities: {}, profiles: {}, sizes: {}, exporting: "h264", splash: false,
   native: null, textModel: null, task: null, monitorOpen: false,
+  mode: "drama", availableModes: ["drama"], faceReady: false, valtzError: "", projectByMode: {},
 };
 let saveInFlight = null;
 let editCount = 0;
@@ -104,29 +107,59 @@ async function reloadCapabilities() {
   state.sizes = result.sizes;
   state.profiles = result.profiles;
   state.native = result.native;
+  state.valtzError = result.valtz_error || "";
   state.splash = result.splash;
+  state.availableModes = result.modes || ["drama"];
+  state.faceReady = !!result.face_swap;
+  $("mode-switch").hidden = state.availableModes.length < 2;
   renderConnection();
   render();
 }
 
 async function reloadProjects() {
   state.projects = await api("/api/projects");
-  const options = state.projects.map(project => node("option", {value: project.id}, project.name));
+  refreshProjectPicker();
+}
+
+function refreshProjectPicker() {
+  const options = state.projects.filter(project => (project.mode || "drama") === state.mode)
+    .map(project => node("option", {value: project.id}, project.name));
   $("project").replaceChildren(node("option", {value: ""}, "选择项目"), ...options);
   $("project").value = state.project?.id || "";
 }
 
 async function openProject(id) {
   await saveProject();
-  if (!id) return;
+  if (!id) {
+    refreshProjectPicker();
+    return;
+  }
   const base = "/api/projects/" + id;
   const [project, jobs] = await Promise.all([api(base), api(base + "/jobs")]);
   state.project = project;
+  state.mode = project.mode || "drama";
+  state.projectByMode[state.mode] = project.id;
   state.jobs = jobs;
   state.shotId = null;
   state.dirty = false;
-  $("project").value = id;
-  go("script");
+  refreshProjectPicker();
+  go(modeHome[state.mode]);
+  schedulePoll();
+}
+
+async function switchMode(mode) {
+  if (mode === state.mode || !state.availableModes.includes(mode)) return;
+  await saveProject();
+  state.mode = mode;
+  state.project = null;
+  state.jobs = [];
+  state.shotId = null;
+  notice("");
+  refreshProjectPicker();
+  const last = state.projects.find(project => project.id === state.projectByMode[mode])
+    || state.projects.find(project => (project.mode || "drama") === mode);
+  if (last) await openProject(last.id);
+  else go(modeHome[mode]);
   schedulePoll();
 }
 
@@ -182,13 +215,26 @@ function render() {
   const work = $("work");
   $("save").disabled = !state.project;
   $("project-name").textContent = !state.project ? "尚未打开项目" : state.project.name + (state.dirty ? " · 有改动" : "");
+  for (const control of document.querySelectorAll("[data-mode-switch]")) {
+    control.setAttribute("aria-pressed", String(control.dataset.modeSwitch === state.mode));
+  }
+  for (const control of document.querySelectorAll("[data-modes]")) {
+    control.hidden = !control.dataset.modes.split(" ").includes(state.mode);
+  }
+  $("model-button").hidden = state.mode === "swap";
+  renderConnection();
   if (!state.project) {
-    work.replaceChildren(title("开启一个项目", "新建项目后上传剧本，或直接添加人物与镜头。"),
-      panel(node("h3", {}, "你的制作流程"), note("剧本与分镜 → 人物定妆 → 逐镜出片 → 导出到下载文件夹")));
+    const intros = {
+      drama: ["开启 AI 剧项目", "新建项目后上传剧本，或直接添加人物与镜头。"],
+      mtv: ["开启 AI-MTV 项目", "新建项目后导入歌曲、歌词和人物参考，安排原音时间轴。"],
+      swap: ["开启 AI 换脸视频项目", "新建项目后上传视频，按识别出的人脸指定各自的参考图。"],
+    };
+    work.replaceChildren(title(...intros[state.mode]));
     renderJobs();
     return;
   }
-  const page = {script: scriptPage, cast: castPage, shot: shotPage, export: exportPage}[state.page]();
+  const page = {script: scriptPage, mtv: () => mtvPage(), cast: castPage, shot: shotPage, export: exportPage,
+    swap: () => faceSwapPage()}[state.page]();
   work.replaceChildren(...page);
   renderJobs();
 }
@@ -261,9 +307,13 @@ async function poll() {
     const completed = jobs.filter(job => job.status !== "running" && state.jobs.some(old => old.id === job.id && old.status === "running"));
     state.jobs = jobs;
     if (completed.length) {
+      for (const item of completed) {
+        if (item.status === "done") notifyCompletion(item.id);
+      }
       const last = completed.at(-1);
       if (last.status === "failed") notice(last.error, true);
       else if (last.kind === "export") notice("已保存 " + last.result.files.length + " 条镜头至 " + last.result.directory);
+      else if (last.kind === "face-export") notice("已保存到 " + last.result.file);
       else notice(jobNames[last.kind] + "已完成。");
       render();
     } else renderJobs();
@@ -281,7 +331,7 @@ function renderJobs() {
     node("p", {class: job.status === "failed" ? "subtle error" : "subtle"},
       job.created.slice(11) + " · " + jobNames[job.kind] + " · " + labels[job.status],
       job.error ? " · " + job.error : "",
-      job.status === "failed" && ["cast-image", "first-image", "video", "export"].includes(job.kind)
+      job.status === "failed" && ["cast-image", "first-image", "video", "export", "face-scan", "face-replace"].includes(job.kind)
         ? node("a", {href: endpoint("/log/" + job.id), target: "_blank", rel: "noopener"}, " 查看记录") : null)));
 }
 
@@ -398,6 +448,10 @@ function durationField(shot, refresh) {
     const value = 2 + i / 2;
     return [String(value), value + " 秒"];
   });
+  if (shot.mtv && !options.some(([value]) => Number(value) === Number(shot.seconds))) {
+    options.push([String(shot.seconds), Number(shot.seconds).toFixed(3) + " 秒 · 原音区间"]);
+    options.sort((a, b) => Number(a[0]) - Number(b[0]));
+  }
   const picker = selectControl(options, shot.seconds, value => {
     update(shot, "seconds", Number(value));
     if (refresh) refresh();
@@ -487,6 +541,7 @@ function shotPage() {
   const supportedSizes = state.sizes[shot.ratio] || [];
   const duration = note(frameInfo(shot));
   const configuration = panel(node("h3", {}, "生成设置"),
+    shot.mtv ? note("原音区间 " + mtvTime(shot.mtv.start_ms) + " → " + mtvTime(shot.mtv.end_ms)) : null,
     field("视频模式", selectControl([["FL2VA", "FL2VA · 首帧 / 首尾帧"], ["Ref2VA", "Ref2VA · 参考图"]], shot.mode,
       value => {update(shot, "mode", value); render();},
       "FL2VA 从选定首帧开始，可加尾帧。Ref2VA 使用定妆参考并由提示词决定构图。")),
@@ -512,6 +567,7 @@ function shotPage() {
 
   const draft = mostRecent("rewrite", shot.id);
   const prompts = panel(node("h3", {}, "视频提示词"),
+    shot.mtv ? note("剪辑提示：" + shot.mtv.cue + (shot.mtv.kind === "performance" ? " · 表演镜头，口型需另验" : "")) : null,
     field("分镜动作草稿", inputControl(shot, "brief", "写明动作与原文对白", 3)),
     row(button("按官方 H3 技能起草", () => start("rewrite", {...shotRequest(shot), prompt: shot.brief || shot.prompt}),
       {disabled: !textModelReady(), help: "按已安装的 MiniMax H3 指南、首尾帧、参考图顺序及镜头时长起草。"}),
@@ -558,7 +614,11 @@ function textModelLabel() {
 }
 
 function renderConnection() {
-  const version = state.native ? "Valtz " + state.native.version + " (" + state.native.build + ")" : "Valtz";
+  if (state.mode === "swap") {
+    $("connection").textContent = state.faceReady ? "本机换脸引擎可用" : "本机换脸引擎未就绪";
+    return;
+  }
+  const version = state.native ? "Valtz " + state.native.version + " (" + state.native.build + ")" : state.valtzError || "Valtz";
   $("connection").textContent = version + " · " + (textModelReady() ? textModelLabel() : "Splash 未连接");
 }
 
@@ -588,11 +648,63 @@ async function openModelDialog() {
 const phaseLabels = {
   "encoding references": "编码参考素材", denoise: "生成画面", "vae decode": "解码画面",
   "save video": "写入视频", export: "导出文件", "text encode": "编码提示词",
+  "face scan": "识别人脸", "face replacement": "逐帧换脸", "copy source audio": "合回原音",
 };
 let pipBody = null;
 let monitorExpanded = true;
 let monitorRequest = false;
 let monitorSignature = "";
+let toneContext;
+let lastTone = "";
+const tonePreference = "valtz-director-completion-sound";
+const toneHistory = "valtz-director-last-completion-sound";
+let soundEnabled = true;
+try {soundEnabled = localStorage.getItem(tonePreference) !== "off";} catch {}
+
+function unlockTone() {
+  const Context = window.AudioContext || window.webkitAudioContext;
+  if (!soundEnabled || !Context) return;
+  if (!toneContext) toneContext = new Context();
+  if (toneContext.state === "suspended") toneContext.resume().catch(() => {});
+}
+
+function playDingDong() {
+  if (toneContext?.state !== "running") return;
+  const time = toneContext.currentTime;
+  for (const [frequency, offset] of [[880, 0], [659.25, 0.165]]) {
+    const start = time + offset;
+    const note = toneContext.createOscillator();
+    const volume = toneContext.createGain();
+    note.type = "sine";
+    note.frequency.value = frequency;
+    volume.gain.setValueAtTime(0.001, start);
+    volume.gain.exponentialRampToValueAtTime(0.17, start + 0.015);
+    volume.gain.exponentialRampToValueAtTime(0.001, start + 0.31);
+    note.connect(volume).connect(toneContext.destination);
+    note.start(start);
+    note.stop(start + 0.33);
+  }
+}
+
+function notifyCompletion(id) {
+  if (!soundEnabled || toneContext?.state !== "running") return;
+  const once = () => {
+    if (lastTone === id) return;
+    try {
+      if (localStorage.getItem(toneHistory) === id) return;
+      localStorage.setItem(toneHistory, id);
+    } catch {}
+    lastTone = id;
+    playDingDong();
+  };
+  if (navigator.locks) navigator.locks.request("valtz-director-completion", once).catch(() => once());
+  else once();
+}
+
+function renderSound() {
+  $("sound-monitor").textContent = soundEnabled ? "提示音开" : "提示音关";
+  $("sound-monitor").setAttribute("aria-pressed", String(soundEnabled));
+}
 
 function fillMonitor(body) {
   const task = state.task;
@@ -634,6 +746,9 @@ async function refreshTask() {
       state.monitorOpen = true;
       monitorExpanded = true;
     }
+    if (task?.status === "done" && state.task?.id === task.id && state.task.status === "running") {
+      notifyCompletion(task.id);
+    }
     state.task = task;
     renderMonitor();
   } catch {
@@ -666,7 +781,7 @@ $("new-project").addEventListener("submit", event => {
   event.preventDefault();
   perform(async () => {
     await saveProject();
-    const project = await api("/api/projects", {name: $("project-title").value.trim()});
+    const project = await api("/api/projects", {name: $("project-title").value.trim(), mode: state.mode});
     $("project-title").value = "";
     await reloadProjects();
     await openProject(project.id);
@@ -708,6 +823,14 @@ $("collapse-monitor").addEventListener("click", () => {
   monitorExpanded = !monitorExpanded;
   renderMonitor();
 });
+$("sound-monitor").addEventListener("click", () => {
+  soundEnabled = !soundEnabled;
+  try {localStorage.setItem(tonePreference, soundEnabled ? "on" : "off");} catch {}
+  if (soundEnabled) unlockTone();
+  renderSound();
+});
+document.addEventListener("pointerdown", unlockTone, {passive: true});
+document.addEventListener("keydown", unlockTone);
 if (window.documentPictureInPicture) {
   $("pin-monitor").hidden = false;
   $("pin-monitor").addEventListener("click", () => perform(pinMonitor));
@@ -715,10 +838,14 @@ if (window.documentPictureInPicture) {
 for (const control of document.querySelectorAll("[data-page]")) {
   control.addEventListener("click", () => go(control.dataset.page));
 }
+for (const control of document.querySelectorAll("[data-mode-switch]")) {
+  control.addEventListener("click", () => perform(() => switchMode(control.dataset.modeSwitch)));
+}
 window.addEventListener("beforeunload", event => {
   if (state.dirty) event.preventDefault();
 });
 render();
+renderSound();
 fillMonitor($("monitor-body"));
 refreshTask();
 setInterval(refreshTask, 2500);
@@ -729,6 +856,7 @@ perform(async () => {
 });
 perform(async () => {
   await reloadProjects();
-  if (state.projects.length) await openProject(state.projects[0].id);
+  const latestDrama = state.projects.find(project => (project.mode || "drama") === "drama");
+  if (latestDrama) await openProject(latestDrama.id);
 });
 perform(reloadCapabilities);
