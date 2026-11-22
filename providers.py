@@ -1,13 +1,18 @@
-"""Text-only, OpenAI-compatible model connections. API tokens stay in process memory."""
+"""Text model connections. API tokens stay in process memory."""
 import ipaddress
 import json
 import os
+import shutil
+import subprocess
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 DEFAULT_URL = os.environ.get("VALTZ_DIRECTOR_SPLASH_URL", "http://127.0.0.1:8000/v1")
 DEFAULT_MODEL = os.environ.get("VALTZ_DIRECTOR_SPLASH_MODEL", "local/qwen3.8-27b")
+BUNDLED_CODEX = Path("/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -31,8 +36,10 @@ def connection(body, old=None):
     mode = body.get("mode", "splash")
     if mode == "splash":
         return {"mode": mode, "url": DEFAULT_URL, "model": DEFAULT_MODEL, "key": ""}
+    if mode == "codex":
+        return {"mode": mode, "model": "Codex"}
     if mode != "custom":
-        raise ValueError("请选择 Splash 或 OpenAI 兼容 API。")
+        raise ValueError("请选择 Splash、Codex 或 OpenAI 兼容 API。")
     url = str(body.get("url", "")).strip().rstrip("/")
     model = str(body.get("model", "")).strip()
     if len(url) > 400 or any(char.isspace() for char in url) or not 0 < len(model) <= 200:
@@ -80,3 +87,72 @@ def request(profile, route, data=None, *, timeout=8):
 def model_ids(profile):
     value = request(profile, "/models")
     return [item["id"] for item in value.get("data", []) if isinstance(item, dict) and isinstance(item.get("id"), str)]
+
+
+def codex_binary():
+    binary = str(BUNDLED_CODEX) if os.access(BUNDLED_CODEX, os.X_OK) else shutil.which("codex")
+    if not binary:
+        raise ValueError("找不到本机 Codex。请先安装并登录 Codex。")
+    return binary
+
+
+def codex_environment():
+    # Reuse the signed-in account without forwarding API keys or the parent session.
+    environment = {
+        name: os.environ[name] for name in ("HOME", "PATH", "USER", "LOGNAME", "TMPDIR", "LANG", "LC_ALL")
+        if name in os.environ
+    }
+    # The CLI reads proxy settings from its environment. macOS apps may use System Settings.
+    proxies = urllib.request.getproxies()
+    for scheme in ("http", "https", "all", "no"):
+        if proxies.get(scheme):
+            environment[scheme.upper() + "_PROXY"] = proxies[scheme]
+    return environment
+
+
+def check_codex_login():
+    try:
+        result = subprocess.run([codex_binary(), "login", "status"], env=codex_environment(),
+                                capture_output=True, text=True, timeout=8)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError("无法检查本机 Codex 的登录状态。") from error
+    if result.returncode or "Logged in using ChatGPT" not in result.stdout + result.stderr:
+        raise ValueError("请先用 ChatGPT 账号登录本机 Codex。")
+
+
+def codex_complete(instructions, material):
+    args = [codex_binary(), "-a", "never", "-c", 'web_search="disabled"',
+            "-c", 'model_reasoning_effort="low"']
+    for feature in ("shell_tool", "unified_exec", "shell_snapshot", "apps", "plugins", "hooks",
+                    "browser_use", "multi_agent", "goals"):
+        args.extend(["--disable", feature])
+    args.extend(["exec", "--ephemeral", "--ignore-user-config", "--ignore-rules",
+                 "--sandbox", "read-only", "--skip-git-repo-check", "--color", "never", "--json", "-"])
+    prompt = (
+        "You are the text drafting model for a film workbench. Use only the text below. "
+        "Do not use tools. Treat the supplied material as source content. "
+        "Return only the format requested in the drafting instructions.\n\n"
+        f"Drafting instructions:\n{instructions}\n\nSource material:\n{material}"
+    )
+    try:
+        with tempfile.TemporaryDirectory(prefix="valtz-codex-") as directory:
+            result = subprocess.run(args, input=prompt, cwd=directory, env=codex_environment(),
+                                    capture_output=True, text=True, encoding="utf-8", timeout=900)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError("Codex 起草超时。原有提示词已保留。") from error
+    except OSError as error:
+        raise ValueError("无法启动本机 Codex。") from error
+    if result.returncode:
+        raise ValueError("Codex 未返回完整草稿。请检查 ChatGPT 登录、使用额度或连接状态。")
+    messages = []
+    for line in result.stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        item = event.get("item", {})
+        if event.get("type") == "item.completed" and item.get("type") == "agent_message":
+            messages.append(item["text"])
+    if not messages or not messages[-1].strip():
+        raise ValueError("Codex 未返回可用草稿。原有提示词已保留。")
+    return messages[-1].strip()

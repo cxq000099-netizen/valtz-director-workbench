@@ -4,19 +4,22 @@ const $ = id => document.getElementById(id);
 const token = document.querySelector('meta[name="director-key"]').content;
 const jobNames = {
   breakdown: "剧本拆分", "mtv-plan": "MTV 剧本与分镜", rewrite: "H3 提示词", "cast-image": "定妆", "first-image": "首帧",
-  video: "镜头视频", export: "导出", "cast-source": "造型参考", "first-upload": "上传首帧", "last-upload": "上传尾帧",
+  video: "镜头视频", export: "导出", "auto-shots": "自动生成镜头",
+  "cast-source": "造型参考", "first-upload": "上传首帧", "last-upload": "上传尾帧",
   "face-scan": "识别人脸", "face-replace": "换脸视频", "face-export": "导出换脸视频",
 };
 const modeHome = {drama: "script", mtv: "mtv", swap: "swap"};
 const state = {
   project: null, projects: [], jobs: [], page: "script", shotId: null, dirty: false,
-  busy: false, capabilities: {}, profiles: {}, sizes: {}, exporting: "h264", splash: false,
+  busy: false, capabilities: {}, profiles: {}, sizes: {}, exporting: "h264", exportEdge: 0, exportEdges: [], splash: false,
   native: null, textModel: null, task: null, monitorOpen: false,
-  mode: "drama", availableModes: ["drama"], faceReady: false, valtzError: "", projectByMode: {},
+  autoShotsReady: false, autoShotIds: new Set(), autoShotsOpen: false,
+  mode: "drama", availableModes: ["drama"], faceReady: false, lookLockReady: false, valtzError: "", projectByMode: {},
 };
 let saveInFlight = null;
 let editCount = 0;
 let pollTimer;
+let pollRequest = false;
 
 function node(tag, options = {}, ...children) {
   const element = document.createElement(tag);
@@ -111,6 +114,9 @@ async function reloadCapabilities() {
   state.splash = result.splash;
   state.availableModes = result.modes || ["drama"];
   state.faceReady = !!result.face_swap;
+  state.lookLockReady = !!result.look_lock;
+  state.exportEdges = result.export_short_edges || [];
+  state.autoShotsReady = !!result.auto_shots;
   $("mode-switch").hidden = state.availableModes.length < 2;
   renderConnection();
   render();
@@ -141,6 +147,8 @@ async function openProject(id) {
   state.projectByMode[state.mode] = project.id;
   state.jobs = jobs;
   state.shotId = null;
+  state.autoShotIds.clear();
+  state.autoShotsOpen = false;
   state.dirty = false;
   refreshProjectPicker();
   go(modeHome[state.mode]);
@@ -197,7 +205,7 @@ function newShot(source = {}) {
     id: makeId(), name: source.name || "新镜头",
     seconds: Math.min(15, Math.max(2, Math.round((Number(source.seconds) || 4.5) * 2) / 2)),
     brief: source.prompt || "", imagePrompt: source.image_prompt || "", prompt: "",
-    ratio: "3:4", size: "768x1024", mode: "FL2VA", quality: "balanced",
+    ratio: "3:4", size: "768x1024", mode: "Ref2VA",
     first: "", last: "", selected: "", refs: [], refine: "auto",
   };
 }
@@ -286,6 +294,9 @@ async function start(kind, data = {}) {
     if (project === state.project && !state.jobs.some(item => item.id === job.id)) state.jobs.push(job);
     notice("已提交" + jobNames[kind] + "。");
     state.monitorOpen = true;
+    monitorExpanded = true;
+    const owner = [...project.cast, ...project.shots].find(item => item.id === job.owner);
+    showTask({...job, project: {id: project.id, name: project.name}, owner_name: owner?.name || ""});
     refreshTask();
   } finally {
     state.busy = false;
@@ -300,13 +311,21 @@ function schedulePoll() {
 }
 
 async function poll() {
+  if (pollRequest || !state.project) return;
+  clearTimeout(pollTimer);
   const project = state.project;
+  pollRequest = true;
   try {
     const jobs = await api(endpoint("/jobs"));
     if (project !== state.project) return;
     const completed = jobs.filter(job => job.status !== "running" && state.jobs.some(old => old.id === job.id && old.status === "running"));
     state.jobs = jobs;
     if (completed.length) {
+      if (completed.some(job => job.kind === "auto-shots") && !state.dirty) {
+        const saved = await api(endpoint());
+        if (project !== state.project) return;
+        if (!state.dirty) state.project = saved;
+      }
       for (const item of completed) {
         if (item.status === "done") notifyCompletion(item.id);
       }
@@ -320,6 +339,7 @@ async function poll() {
   } catch (error) {
     if (project === state.project) notice(error.message, true);
   } finally {
+    pollRequest = false;
     schedulePoll();
   }
 }
@@ -359,7 +379,7 @@ function scriptPage() {
     node("div", {class: "grid"}, field("镜头名称", inputControl(shot, "name", "镜头名称")), durationField(shot)),
     field("分镜动作提示词", inputControl(shot, "brief", "描述景别、动作、对白和镜头节奏", 3)),
     field("首帧生图提示词", inputControl(shot, "imagePrompt", "描述初始构图、人物站位和光线", 3)),
-    field("H3 视频提示词", inputControl(shot, "prompt", "到镜头工作台选择参考素材后，让 Splash 起草", 4))));
+    field("H3 视频提示词", inputControl(shot, "prompt", "到镜头工作台选择参考素材后，用已选模型起草", 4))));
   return [title("剧本与分镜", "逐镜查看和修改提示词，镜头工作台会直接使用这里的内容。"),
     source, draft ? breakdownResult(draft) : null, panel(heading), ...cards].filter(Boolean);
 }
@@ -402,9 +422,9 @@ async function uploadImage(owner, kind, file) {
   }
 }
 
-function modelPicker(object, key, capability, label) {
+function modelPicker(object, key, capability, label, preferred = "") {
   const options = state.capabilities[capability] || [];
-  const fallback = options[0]?.id || "";
+  const fallback = options.find(option => option.id === preferred)?.id || options[0]?.id || "";
   const selected = () => options.some(option => option.id === object[key]) ? object[key] : fallback;
   const select = selectControl(options.length ? options.map(option => [option.id, option.name]) : [["", "无已安装模型"]],
     selected(), value => { update(object, key, value); render(); },
@@ -412,19 +432,41 @@ function modelPicker(object, key, capability, label) {
   return {control: field(label, select), selected};
 }
 
+function adoptionOverview(label, items) {
+  return panel(node("div", {class: "row between"},
+    node("h3", {}, label),
+    node("span", {class: "subtle"}, "已采用 " + items.filter(item => item.adopted).length + " / " + items.length)),
+  node("div", {class: "adoption-list"}, items.map(item => node("button", {
+    type: "button", id: item.id, class: item.adopted ? "adopted" : "",
+    "aria-current": item.current ? "true" : undefined,
+    "aria-label": item.label + (item.adopted ? "，已采用" : "，待采用"),
+    onclick: item.open,
+  }, item.label, item.adopted ? node("span", {"aria-hidden": "true"}, "✓") : null))));
+}
+
 function castPage() {
   const project = state.project;
+  const overview = project.cast.length ? adoptionOverview("人物定妆进度", project.cast.map(person => ({
+    label: person.name || "未命名人物", adopted: !!person.adopted,
+    open: () => {
+      const card = $("cast-" + person.id);
+      card.focus({preventScroll: true});
+      card.scrollIntoView({block: "start"});
+    },
+  }))) : null;
   return [title("人物定妆", "上传你想参考的脸，也可以先生成几张造型，再选一张在各镜头复用。"),
+    overview,
     panel(button("添加人物", () => {update(project, "cast", [...project.cast, newCast()]); render();}, {primary: true})),
-    ...project.cast.map(castCard)];
+    ...project.cast.map(castCard)].filter(Boolean);
 }
 
 function castCard(person) {
   const source = candidates(person.id, ["cast-source"]);
   const selectedSource = person.faceSource || source.at(-1)?.result.file;
   const refs = person.useSources !== false && selectedSource ? [{file: selectedSource, name: person.name}] : [];
-  const model = modelPicker(person, refs.length ? "editModel" : "imageModel", refs.length ? "image-edit" : "text-to-image", "生图模型");
-  return panel(
+  const model = modelPicker(person, refs.length ? "editModel" : "imageModel",
+    refs.length ? "image-edit" : "text-to-image", "生图模型", "qwen-image-2.1");
+  const card = panel(
     field("人物名称", inputControl(person, "name", "角色名")),
     field("上传脸部参考 · PNG / JPEG", uploadControl("image/png,image/jpeg",
       file => uploadImage(person.id, "cast-source", file),
@@ -441,6 +483,9 @@ function castCard(person) {
     mediaCards(candidates(person.id, ["cast-image"]), person.adopted, file => adopt(person, "adopted", file), "采用造型"),
     person.adopted ? node("div", {class: "ref-list"}, node("figure", {},
       node("img", {src: mediaURL(person.adopted), alt: "当前采用造型"}), node("figcaption", {class: "subtle"}, "当前采用"))) : null);
+  card.id = "cast-" + person.id;
+  card.tabIndex = -1;
+  return card;
 }
 
 function durationField(shot, refresh) {
@@ -472,35 +517,155 @@ function activeReferences(shot) {
     .filter(person => person?.adopted).slice(0, 6).map(person => ({file: person.adopted, name: person.name}));
 }
 
+function sharedLooks(shot, previous) {
+  return state.project.cast.filter(person =>
+    shot.refs.includes(person.id) && previous?.refs?.includes(person.id));
+}
+
+function lookControls(shot, previous, refCount) {
+  const lock = shot.lookLock;
+  if (!state.lookLockReady || (!previous && !lock)) return null;
+  const selected = previous?.selected;
+  const shared = sharedLooks(shot, previous);
+  const clip = selected ? node("video", {
+    src: mediaURL(selected), class: "look-clip", controls: true, preload: "metadata", playsinline: true,
+    "aria-label": "上一镜已采用的视频",
+  }) : null;
+  const canEnable = (previous?.first || selected) && (shared.length || (!shot.refs.length && previous.refs.length));
+  const help = "使用上一镜的实际画面作造型参考。两镜共同勾选的人物沿用服装、发型与配饰，新人物使用自己的定妆。";
+  async function pin(frame, time) {
+    const project = state.project;
+    const frameURL = endpoint("/look-frame/" + shot.id);
+    if (activeReferences(shot.refs.length ? shot : previous).length >= 6) {
+      throw Error("请将定妆参考减至 5 张，为上一镜的造型留一个位置。");
+    }
+    if (shot.refs.length && !sharedLooks(shot, previous).length) {
+      throw Error("请在两镜勾选至少一个共同人物。");
+    }
+    if (!frame) {
+      await saveProject();
+      const result = await api(frameURL, {video: selected, time});
+      if (project !== state.project || shot.lookLock !== lock || previous.selected !== selected) return;
+      frame = result.file;
+    }
+    if (!shot.refs.length) update(shot, "refs", [...previous.refs]);
+    if (sharedLooks(shot, previous).length) {
+      update(shot, "lookLock", {previous: previous.id, frame});
+      render();
+      await saveProject();
+    }
+  }
+  return node("div", {},
+    node("label", {class: "check", title: help}, node("input", {
+      type: "checkbox", checked: !!lock, disabled: !lock && !canEnable,
+      onchange: event => {
+        const checked = event.target.checked;
+        event.target.checked = !!lock;
+        perform(async () => {
+          if (checked) await pin(selected ? "" : previous.first);
+          else {
+            update(shot, "lookLock", null);
+            render();
+            await saveProject();
+          }
+        });
+      },
+    }), "延续上一镜人物造型"),
+    !lock && !canEnable ? note(!(previous?.first || selected)
+      ? "先在上一镜采用一张首帧或一条视频。"
+      : "请在两镜勾选共同出场的人物。") : null,
+    lock ? node("div", {class: "ref-list"}, node("figure", {},
+      node("img", {src: mediaURL(lock.frame), alt: "上一镜人物造型参考"}),
+      node("figcaption", {class: "subtle"}, "上一镜造型 · 图 " + (refCount + 1)))) : null,
+    lock ? note(lock.previous !== previous?.id ? "上一镜已变化，请重新选择参考帧。"
+      : shared.length ? "锁定造型 · " + shared.map(person => person.name).join("、")
+        : "请在两镜勾选共同出场的人物。") : null,
+    clip && (lock || canEnable) ? node("details", {},
+      node("summary", {}, "从上一镜已选视频挑参考帧"),
+      note("暂停在共同人物衣服清楚的一帧，再采用当前画面。"), clip,
+      button("用当前画面锁定造型", () => {
+        if (clip.readyState < 2) throw Error("等视频画面载入后再选择。");
+        clip.pause();
+        return pin("", clip.currentTime);
+      })) : null,
+    lock && previous?.first && previous.first !== lock.frame
+      ? button("改用上一镜首帧", () => pin(previous.first)) : null);
+}
+
+function adoptShotFrame(shot, key, file) {
+  if (shot.lookLock) update(shot, "lookLock", {...shot.lookLock, [key]: file});
+  return adopt(shot, key, file);
+}
+
+function shotQuality(shot) {
+  if (shot.quality === "quick") return "balanced";
+  if (shot.quality && (shot.quality !== "balanced" || shot.qualityExplicit)) return shot.quality;
+  return (state.profiles[shot.mode] || []).some(profile => profile.id === "pika") ? "pika" : "balanced";
+}
+
 function shotRequest(shot) {
   const shortEdge = Math.min(...shot.size.split("x").map(Number));
   return {
     owner: shot.id, mode: shot.mode, ratio: shot.ratio, size: shot.size, seconds: shot.seconds,
     first: shot.first, last: shot.last, refs: activeReferences(shot), image_prompt: shot.imagePrompt,
     prompt: shot.prompt || shot.brief,
-    quality: shot.quality === "quick" ? "balanced" : shot.quality,
+    quality: shotQuality(shot),
     refine: shortEdge > 768 ? shot.refine ?? (shot.regenerate ? "on" : "off") : "off",
   };
+}
+
+function autoShotPanel(shots) {
+  if (!state.autoShotsReady) return null;
+  const submit = button("开始自动生成", () => start("auto-shots", {
+    shots: shots.filter(shot => state.autoShotIds.has(shot.id)).map(shot => shot.id),
+  }), {primary: true, disabled: !textModelReady() || !state.autoShotIds.size});
+  const count = node("span", {class: "subtle"}, "已选 " + state.autoShotIds.size + " 镜");
+  const controls = shots.map((shot, index) => node("label", {class: "check"},
+    node("input", {type: "checkbox", checked: state.autoShotIds.has(shot.id), onchange: event => {
+      if (event.target.checked) state.autoShotIds.add(shot.id);
+      else state.autoShotIds.delete(shot.id);
+      count.textContent = "已选 " + state.autoShotIds.size + " 镜";
+      submit.disabled = !textModelReady() || !state.autoShotIds.size;
+    }}), String(index + 1).padStart(2, "0")));
+  return node("details", {class: "panel", open: state.autoShotsOpen,
+    ontoggle: event => {state.autoShotsOpen = event.target.open;}},
+  node("summary", {}, "自动生成镜头"),
+  note("按镜头编号逐个生成首帧、采用 H3 草稿、生成视频候选。已有候选会保留。"),
+  node("div", {class: "adoption-list"}, controls), row(submit, count));
 }
 
 function shotPage() {
   const shots = state.project.shots;
   if (!shots.length) return [title("镜头工作台", "从剧本页添加一个镜头，即可开始挑选首帧和制作视频。")];
   const shot = shots.find(item => item.id === state.shotId) || shots[0];
-  const chooser = selectControl(shots.map((item, i) => [item.id, String(i + 1).padStart(2, "0") + " " + item.name]),
-    shot.id, id => {state.shotId = id; render();}, "切换到另一镜，所有候选按镜头保留。");
+  const overview = adoptionOverview("镜头进度", shots.map((item, index) => ({
+    id: "shot-index-" + item.id, label: String(index + 1).padStart(2, "0"),
+    adopted: !!item.selected, current: item.id === shot.id,
+    open: () => {
+      state.shotId = item.id;
+      render();
+      $("shot-index-" + item.id).focus();
+    },
+  })));
   const adopted = state.project.cast.filter(person => person.adopted);
   const refs = activeReferences(shot);
-  const imageModel = modelPicker(shot, refs.length ? "editModel" : "imageModel", refs.length ? "image-edit" : "text-to-image", "首帧生图模型");
+  const lookLock = state.lookLockReady ? shot.lookLock : null;
+  const previous = shots[shots.indexOf(shot) - 1];
+  const lockIssue = lookLock && (lookLock.previous !== previous?.id ? "请重新选择上一镜的造型参考。"
+    : !sharedLooks(shot, previous).length ? "请在两镜勾选共同出场的人物。"
+    : refs.length >= 6 ? "请将定妆参考减至 5 张，为上一镜的造型留一个位置。"
+    : "");
+  const usingImages = refs.length > 0 || !!lookLock;
+  const imageModel = modelPicker(shot, usingImages ? "editModel" : "imageModel", usingImages ? "image-edit" : "text-to-image", "首帧生图模型");
   const firstFrames = candidates(shot.id, ["first-image", "first-upload"]);
   const lastFrames = candidates(shot.id, ["last-upload"]);
   const referenceInputs = adopted.map(person => node("label", {class: "check"}, node("input", {
     type: "checkbox", checked: shot.refs.includes(person.id), onchange: event => {
       const selected = new Set(shot.refs);
       if (event.target.checked) {
-        if (selected.size >= 6) {
+        if (selected.size >= (lookLock ? 5 : 6)) {
           event.target.checked = false;
-          notice("V0.1 每镜最多选择 6 张参考图。", true);
+          notice(lookLock ? "上一镜的造型占 1 张，最多再选 5 张定妆图。" : "每镜最多选择 6 张参考图。", true);
           return;
         }
         selected.add(person.id);
@@ -515,24 +680,26 @@ function shotPage() {
     refs.length ? node("div", {class: "ref-list"}, refs.map((ref, i) => node("figure", {},
       node("img", {src: mediaURL(ref.file), alt: ref.name}),
       node("figcaption", {class: "subtle"}, "图 " + (i + 1) + " · " + ref.name)))) : null,
+    lookControls(shot, previous, refs.length),
     field("镜头首帧提示词", inputControl(shot, "imagePrompt", "写明人物在画面中的位置、景别与光线", 3)),
     imageModel.control,
     button("生成首帧候选", () => start("first-image", {owner: shot.id, prompt: shot.imagePrompt, refs, ratio: shot.ratio,
-      model: imageModel.selected()}), {primary: true, disabled: !imageModel.selected()}),
+      model: imageModel.selected()}), {primary: true, disabled: !imageModel.selected() || !!lockIssue}),
     field("上传镜头首帧", uploadControl("image/png,image/jpeg", file => uploadImage(shot.id, "first-upload", file))),
-    mediaCards(firstFrames, shot.first, file => adopt(shot, "first", file), "采用首帧"),
+    mediaCards(firstFrames, lookLock && shot.mode === "FL2VA" ? lookLock.first : shot.first,
+      file => adoptShotFrame(shot, "first", file), lookLock && shot.mode === "FL2VA" ? "确认造型并采用首帧" : "采用首帧"),
     shot.mode === "FL2VA" ? node("details", {},
       node("summary", {}, shot.last ? "尾帧已采用" : "添加尾帧（可选）"),
       field("上传尾帧", uploadControl("image/png,image/jpeg", file => uploadImage(shot.id, "last-upload", file))),
-      mediaCards(lastFrames, shot.last, file => adopt(shot, "last", file), "采用尾帧"),
-      shot.last ? button("取消尾帧", () => adopt(shot, "last", "")) : null) : null);
+      mediaCards(lastFrames, lookLock ? lookLock.last : shot.last,
+        file => adoptShotFrame(shot, "last", file), lookLock ? "确认造型并采用尾帧" : "采用尾帧"),
+      shot.last ? button("取消尾帧", () => adoptShotFrame(shot, "last", "")) : null) : null);
 
   const models = state.capabilities[shot.mode === "FL2VA" ? "image-to-video" : "reference-to-video"] || [];
   const expected = shot.mode === "FL2VA" ? "minimax-h3-fl2va" : "minimax-h3-ref2va";
   const videoModel = models.find(model => model.id === expected);
   const profiles = state.profiles[shot.mode] || [];
-  const wanted = shot.quality === "quick" ? "balanced" : shot.quality;
-  const chosenProfile = profiles.find(profile => profile.id === wanted);
+  const chosenProfile = profiles.find(profile => profile.id === shotQuality(shot));
   const idAndLabel = profiles.map(profile => [profile.id, profile.name + " · " + profile.steps + " 步"]);
   if (!chosenProfile) idAndLabel.unshift(["", "请选择当前可用档位"]);
   const shortEdge = Math.min(...shot.size.split("x").map(Number));
@@ -540,12 +707,17 @@ function shotPage() {
   const canRefine = refinerReady && shortEdge > 768;
   const supportedSizes = state.sizes[shot.ratio] || [];
   const duration = note(frameInfo(shot));
+  const frameIssue = lookLock && shot.mode === "FL2VA"
+    && (!shot.first || lookLock.first !== shot.first || (shot.last && lookLock.last !== shot.last))
+    && "确认首帧和已选尾帧的造型一致后，即可生成视频。";
   const configuration = panel(node("h3", {}, "生成设置"),
     shot.mtv ? note("原音区间 " + mtvTime(shot.mtv.start_ms) + " → " + mtvTime(shot.mtv.end_ms)) : null,
     field("视频模式", selectControl([["FL2VA", "FL2VA · 首帧 / 首尾帧"], ["Ref2VA", "Ref2VA · 参考图"]], shot.mode,
       value => {update(shot, "mode", value); render();},
       "FL2VA 从选定首帧开始，可加尾帧。Ref2VA 使用定妆参考并由提示词决定构图。")),
     shot.mode === "FL2VA" ? note(shot.last ? "H3 写法：FL2VA 首尾帧" : "H3 写法：I2VA 单首帧") : note("H3 写法：Ref2VA 六段提示词"),
+    lookLock ? note(lockIssue || frameIssue || (shot.mode === "FL2VA"
+      ? "视频沿用已确认的首帧与尾帧造型。" : "视频会同时使用定妆图和上一镜造型参考。")) : null,
     node("div", {class: "grid"},
       field("画面比例", selectControl(Object.keys(state.sizes).map(value => [value, value]), shot.ratio, value => {
         update(shot, "ratio", value); update(shot, "size", state.sizes[value][0]); render();
@@ -555,7 +727,11 @@ function shotPage() {
     durationField(shot, () => {duration.textContent = frameInfo(shot);}), duration,
     note("模型精度 · " + (videoModel?.precision || "模型未就绪")),
     field("生成档位", selectControl(idAndLabel, chosenProfile?.id ?? "",
-      value => {update(shot, "quality", value); render();}, "由当前 Valtz 读取实际步数与已安装扩展。")),
+      value => {
+        update(shot, "quality", value);
+        update(shot, "qualityExplicit", true);
+        render();
+      }, "由当前 Valtz 读取实际步数与已安装扩展。")),
     chosenProfile ? note(chosenProfile.description) : null,
     field("高分辨率精修", selectControl(
       canRefine ? [["auto", "交给 Valtz 自动决定"], ["on", "强制精修"], ["off", "直接生成"]]
@@ -563,14 +739,15 @@ function shotPage() {
       canRefine ? shot.refine ?? (shot.regenerate ? "on" : "off") : "off",
       value => update(shot, "refine", value), "精修是独立步骤，可和任一可用生成档位搭配。")),
     button("生成视频候选", () => start("video", {...shotRequest(shot), model: videoModel?.id}),
-      {primary: true, disabled: !videoModel || !chosenProfile, help: "以当前提示词和输入生成一条新候选。已有候选会保留。"}));
+      {primary: true, disabled: !videoModel || !chosenProfile || !!lockIssue || !!frameIssue,
+        help: "以当前提示词和输入生成一条新候选。已有候选会保留。"}));
 
   const draft = mostRecent("rewrite", shot.id);
   const prompts = panel(node("h3", {}, "视频提示词"),
     shot.mtv ? note("剪辑提示：" + shot.mtv.cue + (shot.mtv.kind === "performance" ? " · 表演镜头，口型需另验" : "")) : null,
     field("分镜动作草稿", inputControl(shot, "brief", "写明动作与原文对白", 3)),
     row(button("按官方 H3 技能起草", () => start("rewrite", {...shotRequest(shot), prompt: shot.brief || shot.prompt}),
-      {disabled: !textModelReady(), help: "按已安装的 MiniMax H3 指南、首尾帧、参考图顺序及镜头时长起草。"}),
+      {disabled: !textModelReady() || !!lockIssue, help: "按已安装的 MiniMax H3 指南、首尾帧、参考图顺序及镜头时长起草。"}),
     node("span", {class: "subtle"}, textModelLabel())),
     draft ? node("details", {class: "panel"}, node("summary", {}, "查看草稿 · " + draft.result.official_mode),
       field("生成的草稿", node("textarea", {rows: 7, readonly: true, value: draft.result.prompt})),
@@ -580,12 +757,12 @@ function shotPage() {
         await saveProject();
         render();
       })) : null,
-    field("当前视频提示词", inputControl(shot, "prompt", "直接输入，也可采用 Splash 的草稿", 6,
+    field("当前视频提示词", inputControl(shot, "prompt", "直接输入，也可采用模型生成的草稿", 6,
       "此处内容可编辑，并与剧本与分镜页同步。为空时，生成使用分镜动作草稿。")));
   const videos = panel(node("h3", {}, "视频候选"),
     mediaCards(candidates(shot.id, ["video"]), shot.selected, file => adopt(shot, "selected", file), "采用这条"));
-  return [title("镜头工作台", "先定参考和构图，再逐镜抽卡。"), field("当前镜头", chooser),
-    node("div", {class: "tools"}, node("div", {}, source, prompts), configuration), videos];
+  return [title("镜头工作台", "先定参考和构图，再逐镜抽卡。"), overview, autoShotPanel(shots),
+    node("div", {class: "tools"}, node("div", {}, source, prompts), configuration), videos].filter(Boolean);
 }
 
 function exportPage() {
@@ -594,21 +771,28 @@ function exportPage() {
     node("a", {href: mediaURL(shot.selected), target: "_blank", rel: "noopener"}, "查看采用版"), " ",
     button("取消采用", () => adopt(shot, "selected", ""))));
   const exported = mostRecent("export");
+  const resolution = state.exportEdges.length ? field("导出分辨率", selectControl(
+    state.exportEdges.map(edge => [String(edge), edge ? "放大到短边 " + edge + " px" : "保持原始尺寸"]),
+    String(state.exportEdge), value => {state.exportEdge = Number(value);},
+    "按画面比例放大低分辨率镜头。短边已达目标的镜头保留尺寸。短边 1080 时，3:4 竖片输出 1080 × 1440。")) : null;
   return [title("选片与导出", "每镜分别保存，供 DaVinci Resolve 剪辑。"),
     panel(node("h3", {}, "已选 " + selected.length + " 条"),
       list.length ? node("ol", {}, list) : note("先在镜头工作台选择满意的视频候选。"),
       field("输出格式", selectControl([["h264", "MP4 · H.264"], ["prores422hq", "MOV · ProRes 422 HQ"]],
         state.exporting, value => {state.exporting = value;}, "ProRes 适合继续剪辑，文件通常更大。")),
+      resolution,
       note("保存位置：下载 / Valtz 导演操作台 / 当前项目"),
-      button("导出选中镜头", () => start("export", {format: state.exporting}), {primary: true, disabled: !selected.length}),
+      button("导出选中镜头", () => start("export", {format: state.exporting, short_edge: state.exportEdge}),
+        {primary: true, disabled: !selected.length}),
       exported ? note("最近导出：" + exported.result.directory) : null)];
 }
 
 function textModelReady() {
-  return state.textModel?.mode === "custom" || state.splash;
+  return ["custom", "codex"].includes(state.textModel?.mode) || state.splash;
 }
 
 function textModelLabel() {
+  if (state.textModel?.mode === "codex") return "Codex · ChatGPT 账号";
   return state.textModel?.mode === "custom" ? "API · " + state.textModel.model
     : "Splash · " + (state.textModel?.model || "Qwen3.8 27B");
 }
@@ -624,6 +808,7 @@ function renderConnection() {
 
 function showModelFields() {
   $("model-fields").hidden = $("model-mode").value !== "custom";
+  $("model-codex-note").hidden = $("model-mode").value !== "codex";
   $("model-status").textContent = "";
 }
 
@@ -648,11 +833,14 @@ async function openModelDialog() {
 const phaseLabels = {
   "encoding references": "编码参考素材", denoise: "生成画面", "vae decode": "解码画面",
   "save video": "写入视频", export: "导出文件", "text encode": "编码提示词",
+  "export resolution": "调整导出分辨率",
   "face scan": "识别人脸", "face replacement": "逐帧换脸", "copy source audio": "合回原音",
 };
 let pipBody = null;
 let monitorExpanded = true;
 let monitorRequest = false;
+let monitorTimer;
+let monitorClock = window;
 let monitorSignature = "";
 let toneContext;
 let lastTone = "";
@@ -717,8 +905,14 @@ function fillMonitor(body) {
   const children = [node("strong", {}, jobNames[task.kind] + " · " + stateLabel),
     note([task.project.name, task.owner_name].filter(Boolean).join(" / "))];
   if (task.status === "running") {
-    const label = stage ? (phaseLabels[stage.stage] || stage.stage) + " · 阶段 " + stage.percent + "%" : "等待模型返回进度";
-    children.push(node("progress", {max: 100, value: stage?.percent, "aria-label": label}), note(label));
+    const percent = stage?.percent;
+    const phase = phaseLabels[stage?.stage] || stage?.stage;
+    const label = Number.isFinite(percent)
+      ? [phase, "阶段 " + percent + "%"].filter(Boolean).join(" · ")
+      : phase || "模型正在处理";
+    const progress = node("progress", {max: 100, "aria-label": label});
+    if (Number.isFinite(percent)) progress.value = percent;
+    children.push(progress, note(label));
   }
   if (task.error) children.push(node("p", {class: "note error"}, task.error));
   body.replaceChildren(...children);
@@ -737,24 +931,38 @@ function renderMonitor() {
   }
 }
 
+function showTask(task) {
+  if (task?.status === "running" && task.id !== state.task?.id) {
+    state.monitorOpen = true;
+    monitorExpanded = true;
+  }
+  if (task?.status === "done" && state.task?.id === task.id && state.task.status === "running") {
+    notifyCompletion(task.id);
+  }
+  state.task = task;
+  renderMonitor();
+}
+
 async function refreshTask() {
   if (monitorRequest) return;
+  monitorClock.clearTimeout(monitorTimer);
   monitorRequest = true;
+  const previous = state.task;
   try {
     const task = await api("/api/task-status");
-    if (task?.status === "running" && task.id !== state.task?.id) {
-      state.monitorOpen = true;
-      monitorExpanded = true;
+    if (state.task !== previous) return;
+    showTask(task);
+    if (task && task.project.id === state.project?.id) {
+      const listed = state.jobs.find(job => job.id === task.id);
+      if (listed?.status !== task.status) poll();
     }
-    if (task?.status === "done" && state.task?.id === task.id && state.task.status === "running") {
-      notifyCompletion(task.id);
-    }
-    state.task = task;
-    renderMonitor();
   } catch {
     // A lost poll isn't proof that the native task stopped.
   } finally {
     monitorRequest = false;
+    // Keep one timer, including when the main tab is behind the floating window.
+    monitorClock = pipBody?.ownerDocument.defaultView || window;
+    monitorTimer = monitorClock.setTimeout(refreshTask, state.task?.status === "running" ? 800 : 2500);
   }
 }
 
@@ -773,8 +981,11 @@ async function pinMonitor() {
   pipBody.setAttribute("aria-live", "polite");
   doc.body.append(pipBody);
   fillMonitor(pipBody);
-  floating.setInterval(refreshTask, 2500);
-  floating.addEventListener("pagehide", () => {pipBody = null;}, {once: true});
+  refreshTask();
+  floating.addEventListener("pagehide", () => {
+    pipBody = null;
+    refreshTask();
+  }, {once: true});
 }
 
 $("new-project").addEventListener("submit", event => {
@@ -794,11 +1005,13 @@ $("model-button").addEventListener("click", () => perform(openModelDialog));
 $("model-close").addEventListener("click", () => $("model-dialog").close());
 $("model-mode").addEventListener("change", showModelFields);
 $("model-test").addEventListener("click", async () => {
-  $("model-status").textContent = "正在请求模型列表…";
+  const settings = readModelFields();
+  $("model-status").textContent = settings.mode === "codex" ? "正在检查本机 Codex 登录…" : "正在请求模型列表…";
   try {
-    const result = await api("/api/model/test", readModelFields());
-    $("model-status").textContent = result.matched ? "连接成功，找到所选模型。"
-      : "连接成功，模型列表中没有该 ID。请核对服务商提供的名称。";
+    const result = await api("/api/model/test", settings);
+    if ($("model-mode").value !== settings.mode) return;
+    $("model-status").textContent = result.mode === "codex" ? "本机 Codex 已登录 ChatGPT。"
+      : result.matched ? "连接成功，找到所选模型。" : "连接成功，模型列表中没有该 ID。请核对服务商提供的名称。";
   } catch (error) {
     $("model-status").textContent = error.message;
   }
@@ -844,11 +1057,14 @@ for (const control of document.querySelectorAll("[data-mode-switch]")) {
 window.addEventListener("beforeunload", event => {
   if (state.dirty) event.preventDefault();
 });
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) refreshTask();
+});
+window.addEventListener("focus", refreshTask);
 render();
 renderSound();
 fillMonitor($("monitor-body"));
 refreshTask();
-setInterval(refreshTask, 2500);
 perform(async () => {
   state.textModel = await api("/api/model");
   renderConnection();

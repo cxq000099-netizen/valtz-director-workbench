@@ -37,7 +37,7 @@ def transcoder():
     if not path:
         path = Path.home() / ".local/bin/ffmpeg"
     if not Path(path).is_file():
-        raise ValueError("导入歌曲需要 FFmpeg。请安装后重新打开操作台。")
+        raise ValueError("此操作需要 FFmpeg。请安装后重新打开操作台。")
     return str(path)
 
 

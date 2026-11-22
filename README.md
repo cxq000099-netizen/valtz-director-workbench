@@ -2,11 +2,11 @@
 
 A local macOS workbench for directing individual AI video shots with Valtz. Start with a script, choose the cast and opening frames, generate a few takes, and export the clips you want to edit in DaVinci Resolve.
 
-**Version 0.3** · Chinese interface · English documentation
+**Version 0.4** · Chinese interface · English documentation
 
 ## Screenshots
 
-These V0.2 screenshots show the storyboard editor, shot settings, and progress panel using a fictional demo project. V0.3 adds the mode switcher at the top.
+These screenshots use a fictional demo project and show an earlier version of the interface.
 
 | Storyboard and progress | Shot settings | Text model connection |
 | --- | --- | --- |
@@ -23,6 +23,14 @@ Choose **AI 剧**, **AI-MTV**, or **AI 换脸视频** at the top. Each mode has 
 - **Compare Valtz generation profiles.** See the sampling steps that the installed Valtz build resolves for Speed, Balanced, and Quality. Pika Flex and HyperFlow appear when the installed model supports them. High-resolution refinement has its own control.
 - **Watch generation while you work.** The floating panel follows you across projects and workbench pages. On browsers that support Document Picture-in-Picture, open an always-on-top mini window. Percentages refer to the current Valtz stage.
 - **Keep the good takes.** Preview and choose takes independently. Export the selected clips as H.264 MP4 or ProRes 422 HQ MOV, with a shot manifest. Edit the clips in your own timeline.
+
+## What's new in 0.4
+
+- **Generate selected shots in sequence.** Select shot numbers in the shot workbench. The queue generates and adopts an opening frame, drafts and applies the H3 prompt, then produces a video candidate for you to review. It pauses on errors and keeps completed candidates.
+- **Carry the same look across cuts.** A frame from the previous shot anchors the clothes, hair, and accessories of recurring characters. New characters use their own approved references. The batch workflow uses shot context to decide when to apply this setting.
+- **See what's been adopted.** Character names and numbered shots have clickable overviews with checkmarks for adopted looks or video takes. The progress panel refreshes about every 0.8 seconds while a job is active.
+- **Use practical defaults.** Qwen-Image 2.1 is preferred for character portraits when installed. New shots default to Ref2VA and the available Pika Flex profile, which reports six steps on Valtz build 35. A batch shot with no character references uses FL2VA.
+- **Scale selected clips during export.** Choose the original size or a target short edge of 720, 1080, or 1440 pixels. A 3:4 clip at a 1080-pixel short edge exports at 1080 × 1440. Scaling preserves framing and audio and keeps clips already at the target size or above. FFmpeg uses Lanczos scaling.
 
 ## Getting started
 
@@ -66,7 +74,9 @@ Use compatible model files you already have in `VALTZ_DIRECTOR_FACE_MODELS` (def
 
 The default is a running Splash OpenAI-compatible API at `http://127.0.0.1:8000/v1`, using `local/qwen3.8-27b`. In the workbench, open **Prompt model** and enter the base URL, model ID, and optional API key for another compatible service. The **Test connection** button reads the model list. Providers that do not implement that list may still support chat completions.
 
-When you enable an external provider and request a draft, it receives the text needed for that draft. Image and video generation still run through local Valtz. Connection secrets stay in process memory. Restarting the workbench returns to Splash. The provider must accept the OpenAI-compatible Chat Completions format.
+Choose **Codex · ChatGPT account** to use the locally installed Codex CLI with an existing ChatGPT login. This option uses Codex account quota. Custom API providers must accept the OpenAI-compatible Chat Completions format. Test connection checks the Codex login or reads the selected API's model list.
+
+When you request a draft from a remote text provider, that provider receives the relevant text. Image and video generation run through local Valtz. Custom API keys stay in process memory. Restarting the workbench returns to Splash.
 
 ### Local storage and configuration
 
@@ -82,7 +92,7 @@ Projects and generated candidates default to `~/Library/Application Support/Valt
 | `VALTZ_DIRECTOR_SPLASH_URL`, `VALTZ_DIRECTOR_SPLASH_MODEL` | Default local Splash connection |
 | `VALTZ_DIRECTOR_H3_SKILL` | Directory containing the official H3 prompt-writing skill |
 | `VALTZ_DIRECTOR_FFPROBE` | Path to the media inspection executable |
-| `VALTZ_DIRECTOR_FFMPEG` | Path to FFmpeg, needed to import music-video audio |
+| `VALTZ_DIRECTOR_FFMPEG` | Path to FFmpeg for audio import, reference-frame extraction, and scaled exports |
 | `VALTZ_DIRECTOR_FACE_PYTHON` | Python with InsightFace, ONNX Runtime, and OpenCV installed |
 | `VALTZ_DIRECTOR_FACE_MODELS` | Local folder with detector, recognizer, and replacement weights |
 

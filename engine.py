@@ -139,6 +139,8 @@ def gpu_gate():
 
 def complete(system, text, tokens, profile=None):
     profile = profile or providers.connection({})
+    if profile["mode"] == "codex":
+        return providers.codex_complete(system, text)
     payload = {
         "model": profile["model"], "messages": [
             {"role": "system", "content": system}, {"role": "user", "content": text}
@@ -172,7 +174,7 @@ The shot action briefs are planning drafts. Exact H3 rewrite comes after selecti
     raw = complete(system, script, 16000, profile)
     value = parse_json(raw)
     if not isinstance(value, dict) or not isinstance(value.get("cast"), list) or not isinstance(value.get("shots"), list):
-        raise ValueError("Splash 返回的分镜结构有误。原有内容已保留。")
+        raise ValueError("模型返回的分镜结构有误。原有内容已保留。")
     cast = []
     if len(value["cast"]) > 300 or len(value["shots"]) > 300:
         raise ValueError("一次草稿超过项目容量，请按集或场次拆分。")
@@ -193,7 +195,7 @@ The shot action briefs are planning drafts. Exact H3 rewrite comes after selecti
                       "image_prompt": str(shot.get("image_prompt", ""))[:5000],
                       "prompt": str(shot.get("prompt", ""))[:5000]})
     if not shots:
-        raise ValueError("Splash 没有返回可用镜头。原有内容已保留。")
+        raise ValueError("模型没有返回可用镜头。原有内容已保留。")
     return {"cast": cast, "shots": shots}
 
 
@@ -206,9 +208,9 @@ def h3_prompt(data, references, profile=None):
     mode = data["mode"]
     first, last, refs = references
     if mode == "Ref2VA" and not refs:
-        raise ValueError("先在镜头中选择人物参考图，再让 Splash 写 Ref2VA 提示词。")
+        raise ValueError("先在镜头中选择人物参考图，再起草 Ref2VA 提示词。")
     if mode == "FL2VA" and not first:
-        raise ValueError("先采用镜头首帧，再让 Splash 按首帧和实际输入写提示词。")
+        raise ValueError("先采用镜头首帧，再按首帧和实际输入起草提示词。")
     official_mode = "Ref2VA" if mode == "Ref2VA" else "FL2VA" if last else "I2VA"
     guide_name = "ref-en.txt" if mode == "Ref2VA" else "base-en.txt"
     guide = skill_text() + "\n" + skill_text("references/" + guide_name)
@@ -233,11 +235,11 @@ Return only the final prompt as plain text, no Markdown fences or discussion."""
     fields += ["overall_soundscape", "non_diegetic_music"]
     positions = [result.find(key + ":") for key in fields]
     if min(positions) < 0 or positions != sorted(positions):
-        raise ValueError("Splash 的草稿缺少 H3 字段或字段顺序有误。原提示词已保留。")
+        raise ValueError("草稿缺少 H3 字段或字段顺序有误。原提示词已保留。")
     if official_mode in ("I2VA", "FL2VA"):
         alignment = result[:positions[0]]
         if "0.00" not in alignment or (last and f"{seconds:.2f}" not in alignment):
-            raise ValueError("Splash 的草稿未按首尾帧时点对齐。原提示词已保留。")
+            raise ValueError("草稿未按首尾帧时点对齐。原提示词已保留。")
     return {"prompt": result, "official_mode": official_mode, "frames": align_frames(data["seconds"])}
 
 
@@ -344,6 +346,29 @@ def generate(root, project, job, data, references):
         run_ctl(["export", native, asset, "--format", fmt, "-o", output], env, log)
         metadata = verify_media(output, kind)
         return {"file": filename, "asset": asset, "seed": seed, "model": model, "size": data["size"], **metadata}
+
+
+def export_size(source_size, short_edge):
+    width, height = map(int, source_size.split("x"))
+    source_edge = min(width, height)
+    if source_edge >= short_edge:
+        return None
+    return tuple(round(side * short_edge / source_edge / 2) * 2 for side in (width, height))
+
+
+def scale_export(ffmpeg, source, destination, fmt, size, log):
+    width, height = size
+    encoding = (["-c:v", "libx264", "-preset", "fast", "-crf", "17", "-pix_fmt", "yuv420p",
+                 "-movflags", "+faststart"] if fmt == "h264"
+                else ["-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le"])
+    args = [ffmpeg, "-nostdin", "-v", "error", "-i", str(source), "-map", "0:v:0", "-map", "0:a?",
+            "-vf", f"scale={width}:{height}:flags=lanczos,setsar=1", "-fps_mode", "passthrough",
+            *encoding, "-c:a", "copy", str(destination)]
+    with log.open("a", encoding="utf-8") as report:
+        try:
+            subprocess.run(args, stdout=report, stderr=subprocess.STDOUT, check=True, timeout=900)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise ValueError(f"{destination.name} 放大导出失败，请查看任务日志。") from error
 
 
 def verify_media(file, kind):

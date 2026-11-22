@@ -48,6 +48,10 @@ main { min-width: 0; padding: 24px 30px 45px; }
 .intro { margin-bottom: 18px; }
 .intro p,.note { margin-top: 5px; }
 .panel { background: var(--paper); border: 1px solid var(--line); border-radius: 11px; padding: 16px; margin-bottom: 13px; min-width: 0; }
+.adoption-list { display: flex; flex-wrap: wrap; align-content: start; gap: 6px; max-height: 13rem; overflow: auto; margin-top: 9px; padding: 3px; }
+.adoption-list button { display: inline-flex; align-items: center; justify-content: center; gap: 4px; min-width: 38px; padding: 4px 7px; font-size: 13px; font-variant-numeric: tabular-nums; }
+.adoption-list button.adopted { color: var(--accent); background: var(--soft); }
+.adoption-list button[aria-current="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); font-weight: 600; }
 .field { display: grid; gap: 5px; min-width: 0; margin: 10px 0; color: var(--mute); font-size: 13px; }
 .field :is(input,select,textarea) { color: var(--ink); font-size: 14px; }
 .check { display: flex; align-items: flex-start; gap: 7px; margin: 8px 0; color: var(--mute); }
@@ -62,6 +66,7 @@ main { min-width: 0; padding: 24px 30px 45px; }
 .ref-list { margin: 9px 0; display: flex; flex-wrap: wrap; gap: 8px; }
 .ref-list img { width: 94px; height: 114px; object-fit: cover; border-radius: 7px; }
 .ref-list figure { margin: 0; }
+.look-clip { display: block; width: min(100%, 320px); max-height: 240px; margin: 8px 0; }
 figure { margin: 0; }
 #message { background: var(--soft); padding: 10px 13px; border-radius: 8px; margin-bottom: 14px; overflow-wrap: anywhere; }
 #message.error,.error { color: var(--error); }

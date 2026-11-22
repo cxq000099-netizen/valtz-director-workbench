@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="director-key" content="__DIRECTOR_KEY__">
-  <title>Valtz 导演操作台 V0.3</title>
+  <title>Valtz 导演操作台 V0.4</title>
   <link rel="stylesheet" href="/app.css">
   <script src="/app.js" defer></script>
   <script src="/mtv.js" defer></script>
@@ -12,7 +12,7 @@
 </head>
 <body>
   <header class="top">
-    <div class="brand"><span class="mark" aria-hidden="true">▷</span><div><h1>Valtz 导演操作台</h1><small>本机工作室 · V0.3</small></div></div>
+    <div class="brand"><span class="mark" aria-hidden="true">▷</span><div><h1>Valtz 导演操作台</h1><small>本机工作室 · V0.4</small></div></div>
     <div class="mode-switch" id="mode-switch" aria-label="制作模式" hidden>
       <button type="button" data-mode-switch="drama" aria-pressed="true">AI 剧</button>
       <button type="button" data-mode-switch="mtv" aria-pressed="false">AI-MTV</button>
@@ -58,8 +58,13 @@
     <form id="model-form">
       <div class="row between"><h2>提示词模型</h2><button type="button" id="model-close">关闭</button></div>
       <label class="field">连接方式
-        <select id="model-mode"><option value="splash">Splash · 本地默认</option><option value="custom">OpenAI 兼容 API</option></select>
+        <select id="model-mode">
+          <option value="splash">Splash · 本地默认</option>
+          <option value="codex">Codex · ChatGPT 账号</option>
+          <option value="custom">OpenAI 兼容 API</option>
+        </select>
       </label>
+      <p id="model-codex-note" class="note" hidden>使用本机 Codex 已登录的 ChatGPT 账号。拆分剧本、起草分镜或提示词时会将对应文字发送给 Codex，计入 Codex 使用额度。图片和视频由本机 Valtz 生成。</p>
       <div id="model-fields" hidden>
         <label class="field">API 基础地址<input id="model-url" type="url" placeholder="https://example.com/v1" title="支持 HTTPS 服务和本机 HTTP 服务。填写基础地址，不加 /chat/completions。"></label>
         <label class="field">模型 ID<input id="model-id" maxlength="200" placeholder="服务商提供的模型 ID"></label>
@@ -68,7 +73,7 @@
         <p class="note">启用后，点击拆分或起草时会将相应文字交给所选 API。图片和视频仍由本机 Valtz 生成。重启工作台后回到 Splash。</p>
       </div>
       <p id="model-status" class="note" role="status"></p>
-      <div class="row model-actions"><button id="model-test" type="button" title="仅请求模型列表，不发送剧本或提示词。">测试连接</button><button type="submit" class="primary">使用这个模型</button></div>
+      <div class="row model-actions"><button id="model-test" type="button" title="检查 Codex 登录或读取 API 模型列表。">测试连接</button><button type="submit" class="primary">使用这个模型</button></div>
     </form>
   </dialog>
 </body>

@@ -12,6 +12,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import tempfile
 import threading
 import urllib.parse
 import webbrowser
@@ -32,7 +33,8 @@ DOCUMENT_LIMIT = 12 * 1024 * 1024
 APP_TITLE = "Valtz 导演操作台"
 PROJECT_MODES = ("drama", "mtv", "swap")
 FACE_JOBS = ("face-scan", "face-replace", "face-export")
-TRACKED_JOBS = ("breakdown", "mtv-plan", "rewrite", "cast-image", "first-image", "video", "export") + FACE_JOBS
+TRACKED_JOBS = ("breakdown", "mtv-plan", "rewrite", "cast-image", "first-image", "video", "export", "auto-shots") + FACE_JOBS
+EXPORT_SHORT_EDGES = (0, 720, 1080, 1440)
 
 
 def project_mode(doc):
@@ -79,6 +81,13 @@ def seconds(value):
 
 def safe_name(value):
     return re.sub(r'[/:\\<>|"*?\x00-\x1f]', "_", value).strip(" .")[:70] or "未命名"
+
+
+def shot_pair(doc, owner):
+    for index, shot in enumerate(doc["shots"]):
+        if shot["id"] == owner:
+            return shot, doc["shots"][index - 1] if index else None
+    raise ValueError("找不到该镜头。")
 
 
 def ingest_script(data, filename):
@@ -166,8 +175,10 @@ class Workbench:
                     if not isinstance(item, dict) or not ID.fullmatch(item.get("id", "")):
                         raise ValueError("无效的分镜编号。")
                     self.validate_selection(path, item)
-                    if collection == "shots" and "mtv" in item:
-                        self.mtv_shot(path, item["mtv"])
+                    if collection == "shots":
+                        if "mtv" in item:
+                            self.mtv_shot(path, item["mtv"])
+                        self.validate_look_lock(path, item.get("lookLock"))
                     cleaned[collection].append(item)
             if body.get("mtv") is not None:
                 cleaned["mtv"] = self.mtv_settings(path, body["mtv"], cleaned["cast"])
@@ -196,6 +207,80 @@ class Workbench:
         if file.suffix not in (".jpg", ".png"):
             raise ValueError("此位置仅接受图片。")
         return file
+
+    def validate_look_lock(self, path, lock):
+        if lock is None:
+            return
+        if (not isinstance(lock, dict) or not isinstance(lock.get("previous"), str)
+                or not ID.fullmatch(lock["previous"])):
+            raise ValueError("人物造型锁定记录无效。")
+        for key in ("frame", "first", "last"):
+            value = lock.get(key, "")
+            if not isinstance(value, str) or (key == "frame" and not value):
+                raise ValueError("请为人物造型锁定选择参考帧。")
+            if value:
+                self.image(path, value)
+
+    def grab_look_frame(self, path, owner, body):
+        doc = read_json(path / "project.json")
+        _, previous = shot_pair(doc, owner)
+        if not previous or not previous.get("selected") or previous["selected"] != body.get("video"):
+            raise ValueError("上一镜的已选视频已变化，请重新选择参考画面。")
+        source = self.media(path, previous["selected"])
+        if source.suffix != ".mp4":
+            raise ValueError("上一镜没有已采用的视频。")
+        duration = engine.verify_media(source, "video")["duration"]
+        time = body.get("time", duration / 2)
+        if type(time) not in (int, float) or not 0 <= time <= duration + 0.1:
+            raise ValueError("请在上一镜视频内选择参考画面。")
+        time = min(time, max(0, duration - 1 / 24))
+        filename = uid() + ".jpg"
+        output = path / "media" / filename
+        try:
+            subprocess.run([mtv.transcoder(), "-nostdin", "-v", "error", "-protocol_whitelist", "file",
+                            "-ss", f"{time:.6f}", "-i", str(source), "-map", "0:v:0", "-frames:v", "1",
+                            "-q:v", "2", "-threads", "1", str(output)], check=True,
+                           capture_output=True, timeout=30)
+            engine.verify_media(output, "image")
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            output.unlink(missing_ok=True)
+            raise ValueError("无法截取该画面，请拖到上一镜中人物清晰的一帧再试。") from error
+        return {"file": filename}
+
+    def apply_look_lock(self, path, doc, job, data, first, last, refs):
+        shot, previous = shot_pair(doc, job["owner"])
+        lock = shot.get("lookLock")
+        if not lock:
+            return
+        self.validate_look_lock(path, lock)
+        if not previous or lock["previous"] != previous["id"]:
+            raise ValueError("上一镜已变化，请重新选择延续造型的参考帧。")
+        shared = set(shot.get("refs", [])) & set(previous.get("refs", []))
+        people = [person["name"] for person in doc["cast"] if person["id"] in shared]
+        if not people:
+            raise ValueError("两镜至少要勾选一个相同的人物，才能延续造型。")
+        names = "、".join(people)
+        if job["kind"] == "first-image" or data.get("mode") == "Ref2VA":
+            if len(refs) >= 6:
+                raise ValueError("延续造型需要占用 1 张参考图，请将定妆参考减至 5 张以内。")
+            label = f"图 {len(refs) + 1}" if job["kind"] == "first-image" else f"<Picture {len(refs) + 1}>"
+            refs.append((self.image(path, lock["frame"]), ("上一镜造型：" + names)[:100]))
+            directive = (
+                f"{names}的服装款式、颜色、图案、发型与配饰沿用{label}中各自对应的人物。"
+                f"服装、发型与配饰以{label}为准，即使镜头草稿对造型另有描述。人物身份仍匹配各自的定妆图。"
+                "其余人物使用自己的定妆参考。构图、背景、姿势与动作按本镜要求。"
+            )
+        else:
+            if job["kind"] == "video" and (not first or lock.get("first") != first.name
+                                           or (last and lock.get("last") != last.name)):
+                raise ValueError("请先在构图与参考中确认并采用与上一镜造型一致的首帧及已选尾帧。")
+            directive = f"{names}在整个镜头中保持已提供首帧里的服装、发型和配饰。"
+        prompt = data["prompt"].rstrip()
+        # Keep guidance inside the visual fields when the draft follows the H3 schema.
+        marker = re.search(r"(?m)^\s*detailed_description:" if data.get("mode") == "Ref2VA"
+                           else r"(?m)^\s*overall_soundscape:", prompt) if job["kind"] == "video" else None
+        data["prompt"] = (prompt[:marker.start()].rstrip() + "\n" + directive + "\n\n" + prompt[marker.start():].lstrip()
+                          if marker else prompt + "\n\n" + directive)
 
     def upload_image(self, path, owner, data, purpose):
         doc = read_json(path / "project.json")
@@ -343,7 +428,12 @@ class Workbench:
                 raise ValueError("当前项目模式不支持这个任务。")
             group = "cast" if kind == "cast-image" else "shots"
             owner = body.get("owner", "")
-            if kind not in ("breakdown", "mtv-plan", "export", *FACE_JOBS) and not any(x["id"] == owner for x in doc[group]):
+            if kind == "auto-shots":
+                keys = body.get("shots")
+                if (not isinstance(keys, list) or not keys or not all(isinstance(key, str) for key in keys)
+                        or len(keys) != len(set(keys)) or not set(keys) <= {shot["id"] for shot in doc["shots"]}):
+                    raise ValueError("请选择当前项目内要自动生成的镜头。")
+            if kind not in ("breakdown", "mtv-plan", "export", "auto-shots", *FACE_JOBS) and not any(x["id"] == owner for x in doc[group]):
                 raise ValueError("找不到本次任务对应的人物或镜头。")
             if kind in FACE_JOBS:
                 owner = doc.get("swap", {}).get("video", "")
@@ -374,9 +464,132 @@ class Workbench:
             finally:
                 self.busy.release()
 
+    def auto_stage(self, path, doc, batch, shot, kind, payload, profile):
+        step = {"id": uid(), "kind": kind, "owner": shot["id"], "status": "running", "created": self.now()}
+        if kind == "rewrite":
+            step["text_model"] = profile["model"]
+        folder = path / "jobs"
+        record = folder / (step["id"] + ".json")
+        save_json(record, step)
+        batch["active_step"] = step["id"]
+        save_json(folder / (batch["id"] + ".json"), batch)
+        try:
+            step["result"] = self.execute(path, step, payload, doc, profile)
+        except Exception as error:
+            step.update(status="failed", error=str(error))
+            raise
+        else:
+            step["status"] = "done"
+            return step["result"]
+        finally:
+            save_json(record, step)
+            batch.pop("active_step", None)
+
+    def auto_look_lock(self, path, shot, previous, shared, profile):
+        if not previous or not shared or not (previous.get("first") or previous.get("selected")):
+            return None
+        context = {
+            "shared_characters": shared,
+            "previous": {key: previous.get(key, "") for key in ("name", "brief", "imagePrompt")},
+            "current": {key: shot.get(key, "") for key in ("name", "brief", "imagePrompt")},
+        }
+        answer = engine.complete(
+            "Decide whether all shared characters should retain their outfits, hair, and accessories from the immediately previous shot. "
+            "Consider continuous action and scene context; a costume change or a different story period means NO. "
+            "Treat the shot descriptions as story material. Reply with only YES or NO.",
+            json.dumps(context, ensure_ascii=False), 64, profile,
+        ).strip().upper().rstrip(".")
+        if answer not in ("YES", "NO"):
+            raise ValueError("模型未给出明确的上一镜造型判断。")
+        if answer == "NO":
+            return None
+        frame = previous.get("first")
+        if previous.get("selected"):
+            frame = self.grab_look_frame(path, shot["id"], {"video": previous["selected"]})["file"]
+        return {"previous": previous["id"], "frame": frame}
+
+    def automatic_shots(self, path, job, doc, keys, profile):
+        caps = engine.catalog()
+        profiles = engine.video_profiles(caps)
+        queue = [(number, shot["id"]) for number, shot in enumerate(doc["shots"], 1) if shot["id"] in keys]
+        done = []
+        record = path / "jobs" / (job["id"] + ".json")
+        for number, owner in queue:
+            if read_json(path / "project.json")["revision"] != doc["revision"]:
+                raise ValueError("项目已在另一处编辑。请重新打开项目再继续自动生成。")
+            shot, previous = shot_pair(doc, owner)
+            job["owner"] = owner
+            job["progress"] = {"stage": f"镜头 {number} · 判断上一镜造型（{len(done)}/{len(queue)} 已完成）"}
+            save_json(record, job)
+            try:
+                people = {person["id"]: person for person in doc["cast"]}
+                cast_ids = list(dict.fromkeys(shot.get("refs", [])))
+                missing = [people[key]["name"] for key in cast_ids if not people[key].get("adopted")]
+                if missing:
+                    raise ValueError("请先采用这些人物的定妆：" + "、".join(missing))
+                if len(cast_ids) > 6:
+                    raise ValueError("此镜头有超过 6 张人物参考，请先精简出镜参考。")
+                refs = [{"file": people[key]["adopted"], "name": people[key]["name"]} for key in cast_ids]
+                mode = shot.get("mode", "Ref2VA") if refs else "FL2VA"
+                choices = {item["id"] for item in profiles.get(mode, [])}
+                quality = shot.get("quality")
+                if quality == "quick":
+                    quality = "balanced"
+                elif not quality or (quality == "balanced" and not shot.get("qualityExplicit")):
+                    quality = "pika" if "pika" in choices else "balanced"
+                if quality not in choices:
+                    raise ValueError("该镜头的 H3 视频模型或生成档位不可用。")
+                shared = [people[key]["name"] for key in cast_ids if previous and key in previous.get("refs", [])]
+                look = self.auto_look_lock(path, shot, previous, shared, profile)
+                if look and len(refs) == 6:
+                    raise ValueError("延续造型需要额外 1 张参考图，请将定妆图减到 5 张。")
+                if look and mode == "FL2VA" and shot.get("last"):
+                    raise ValueError("该镜头有尾帧，请手动确认尾帧造型后制作。")
+                shot["lookLock"] = look
+                shot["mode"] = mode
+                image_prompt = shot.get("imagePrompt") or shot.get("brief") or shot.get("prompt")
+                brief = shot.get("brief") or shot.get("prompt") or image_prompt
+                use_ref = bool(refs or look)
+                image_options = caps.get("image-edit" if use_ref else "text-to-image", [])
+                model_key = shot.get("editModel" if use_ref else "imageModel")
+                model = next((item["id"] for item in image_options if item["id"] == model_key),
+                             image_options[0]["id"] if image_options else None)
+                if not model:
+                    raise ValueError("缺少当前镜头所需的生图模型。")
+                inputs = {"refs": refs, "ratio": shot["ratio"]}
+                job["progress"]["stage"] = f"镜头 {number} · 生成首帧"
+                result = self.auto_stage(path, doc, job, shot, "first-image",
+                                         {**inputs, "prompt": image_prompt, "model": model}, profile)
+                shot["first"] = result["file"]
+                if look:
+                    look["first"] = shot["first"]
+                doc = self.save(path, doc)
+                shot, _ = shot_pair(doc, owner)
+                short_edge = min(map(int, shot["size"].split("x")))
+                video_refs = refs
+                if mode == "Ref2VA" and len(refs) + bool(look) < 6:
+                    video_refs = [*refs, {"file": shot["first"], "name": "本镜首帧构图参考"}]
+                request = {**inputs, "refs": video_refs,
+                           "mode": mode, "first": shot["first"], "last": shot.get("last"),
+                           "seconds": shot["seconds"], "size": shot["size"], "quality": quality,
+                           "image_prompt": image_prompt, "model": engine.H3_VIDEO[mode],
+                           "refine": shot.get("refine", "auto") if short_edge > 768 else "off"}
+                job["progress"]["stage"] = f"镜头 {number} · 起草 H3 提示词"
+                draft = self.auto_stage(path, doc, job, shot, "rewrite", {**request, "prompt": brief}, profile)
+                shot["prompt"] = draft["prompt"]
+                doc = self.save(path, doc)
+                job["progress"]["stage"] = f"镜头 {number} · 生成视频候选"
+                result = self.auto_stage(path, doc, job, shot, "video", {**request, "prompt": draft["prompt"]}, profile)
+                done.append({"shot": owner, "file": result["file"]})
+            except (ValueError, OSError, KeyError, subprocess.SubprocessError) as error:
+                raise ValueError(f"镜头 {number}《{shot['name']}》暂停，已完成 {len(done)}/{len(queue)} 镜。{error}") from error
+        return {"shots": done}
+
     def execute(self, path, job, data, doc, profile):
         self.check_drive()
         kind = job["kind"]
+        if kind == "auto-shots":
+            return self.automatic_shots(path, job, doc, data["shots"], profile)
         if kind in FACE_JOBS:
             options = self.swap_settings(path, doc.get("swap") or {})
             video = self.swap_source(path, options["video"])
@@ -408,7 +621,7 @@ class Workbench:
                 raise ValueError("先为选定人数采用定妆图，或选择 0 人的意象 MTV。")
             return mtv.draft(settings, track, cast, profile)
         if kind == "export":
-            return self.export(path, job, doc, data.get("format"))
+            return self.export(path, job, doc, data.get("format"), data.get("short_edge", 0))
         data["prompt"] = text(data.get("prompt"), "提示词", required=True)
         first = last = None
         if kind in ("rewrite", "video"):
@@ -429,15 +642,19 @@ class Workbench:
         if kind in ("cast-image", "first-image") or data.get("mode") == "Ref2VA":
             for ref in data.get("refs", [])[:6]:
                 refs.append((self.image(path, ref["file"]), text(ref["name"], "参考图名称", 100, True)))
+        if kind in ("first-image", "rewrite", "video"):
+            self.apply_look_lock(path, doc, job, data, first, last, refs)
         if kind == "rewrite":
             return engine.h3_prompt(data, (first, last, refs), profile)
         if data["prompt"].startswith("@"):
             raise ValueError("提示词开头请使用文字，避免被 Valtz 当成素材编号。")
         return engine.generate(self.root, path, job, data, (first, last, refs))
 
-    def export(self, path, job, doc, fmt):
+    def export(self, path, job, doc, fmt, short_edge=0):
         if fmt not in engine.FORMATS:
             raise ValueError("请选择导出格式。")
+        if type(short_edge) is not int or short_edge not in EXPORT_SHORT_EDGES:
+            raise ValueError("请选择有效的导出分辨率。")
         chosen = [(index, shot) for index, shot in enumerate(doc["shots"], 1) if shot.get("selected")]
         if not chosen:
             raise ValueError("请先选中至少一条视频。")
@@ -452,23 +669,49 @@ class Workbench:
                 tracks[track["id"]] = track
         output_root = Path.home() / "Downloads" / "Valtz 导演操作台" / safe_name(doc["name"])
         output = output_root / (datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + job["id"][:6])
-        output.mkdir(parents=True)
+        output_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".export-", dir=output_root) as folder:
+            files = self.render_export(path, job, doc, fmt, short_edge, chosen, assets, tracks, Path(folder))
+            Path(folder).rename(output)
+        return {"directory": str(output), "files": files}
+
+    def render_export(self, path, job, doc, fmt, short_edge, chosen, assets, tracks, output):
+        ffmpeg = mtv.transcoder() if short_edge else None
         env = engine.runtime_env(self.root) if fmt != "h264" else None
+        log = path / "jobs" / (job["id"] + ".log")
         files = []
         placements = []
         masters = {}
+        dimensions = {}
+        count = len(chosen)
         with (engine.gpu_gate() if fmt != "h264" else contextlib.nullcontext()):
-            for index, shot in chosen:
+            for completed, (index, shot) in enumerate(chosen):
                 selected = shot["selected"]
                 filename = f"{index:02d}_{safe_name(shot['name'])}{engine.FORMATS[fmt]}"
                 file = output / filename
+                source = self.media(path, selected)
+                size = engine.export_size(engine.verify_media(source, "video")["size"], short_edge) if short_edge else None
+                native = output / ".source.mov" if size and fmt != "h264" else file
                 if fmt == "h264":
-                    shutil.copyfile(self.media(path, selected), file)
+                    if not size:
+                        shutil.copyfile(source, file)
                 else:
-                    engine.run_ctl(["export", path / "镜头素材.valtz", assets[selected], "--format", fmt, "-o", file],
-                                   env, path / "jobs" / (job["id"] + ".log"))
-                engine.verify_media(file, "video")
+                    engine.run_ctl(["export", path / "镜头素材.valtz", assets[selected], "--format", fmt, "-o", native], env, log)
+                    source = native
+                if size:
+                    with log.open("a", encoding="utf-8") as report:
+                        report.write(f"[PROGRESS] {completed * 100 // count}% of 'export resolution'\n")
+                    engine.scale_export(ffmpeg, source, file, fmt, size, log)
+                    if native != file:
+                        native.unlink()
+                checked = engine.verify_media(file, "video")
+                if size and checked["size"] != f"{size[0]}x{size[1]}":
+                    raise ValueError(f"{filename} 的导出尺寸与设定不符。")
+                dimensions[filename] = checked["size"]
                 files.append(filename)
+                if short_edge:
+                    with log.open("a", encoding="utf-8") as report:
+                        report.write(f"[PROGRESS] {len(files) * 100 // count}% of 'export resolution'\n")
                 if shot.get("mtv"):
                     placement = shot["mtv"]
                     placements.append({"file": filename, "song": placement["track_id"],
@@ -478,10 +721,12 @@ class Workbench:
             shutil.copyfile(path / "tracks" / track["preview"], output / name)
             masters[key] = name
         manifest = {"project": doc["name"], "files": files}
+        if short_edge:
+            manifest.update(target_short_edge=short_edge, resolutions=dimensions)
         if placements:
             manifest.update(mtv_placements=placements, song_audio=masters)
         save_json(output / "镜头清单.json", manifest)
-        return {"directory": str(output), "files": files}
+        return files
 
     def recover(self):
         files = sorted(self.root.glob("*/jobs/*.json"), key=lambda file: file.stat().st_mtime)
@@ -506,7 +751,12 @@ class Workbench:
         owner = next((item["name"] for item in document["cast"] + document["shots"] if item["id"] == job["owner"]), "")
         job["owner_name"] = owner
         if job["status"] == "running":
-            job["progress"] = native_progress(project / "jobs" / (key + ".log"))
+            step = job.get("active_step", key)
+            measured = native_progress(project / "jobs" / (step + ".log"))
+            progress = job.get("progress")
+            if progress and measured:
+                progress = {**measured, "stage": f"{progress['stage']} · {measured['stage']}"}
+            job["progress"] = progress or measured
         # Results can contain entire prompts. The floating monitor only needs status.
         job.pop("result", None)
         return job
@@ -605,7 +855,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 splash = False
             self.json({"valtz": caps, "native": native, "profiles": profiles, "valtz_error": valtz_error,
                        "sizes": engine.SIZES, "splash": splash, "modes": list(PROJECT_MODES),
-                       "face_swap": face_swap.available(app.root)})
+                       "face_swap": face_swap.available(app.root), "look_lock": True,
+                       "export_short_edges": list(EXPORT_SHORT_EDGES), "auto_shots": True})
             return
         if parts == ["api", "task-status"] and not writing:
             self.json(app.task_status())
@@ -615,11 +866,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 settings = providers.connection(self.body(), app.custom)
                 if settings["mode"] == "custom":
                     app.custom = settings
+                elif settings["mode"] == "codex":
+                    providers.check_codex_login()
                 app.profile = settings
             self.json(providers.public_details(app.profile, app.custom))
             return
         if parts == ["api", "model", "test"] and writing:
             settings = providers.connection(self.body(), app.custom)
+            if settings["mode"] == "codex":
+                providers.check_codex_login()
+                self.json({"mode": "codex", "matched": True})
+                return
             ids = providers.model_ids(settings)
             self.json({"count": len(ids), "matched": settings["model"] in ids})
             return
@@ -673,6 +930,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             if action == "jobs" and len(parts) == 4:
                 self.json(app.start(project, self.body()) if writing else app.jobs(project))
+                return
+            if action == "look-frame" and len(parts) == 5 and writing:
+                self.json(app.grab_look_frame(project, parts[4], self.body()))
                 return
             if action == "media" and len(parts) == 5 and not writing:
                 self.send_media(app.media(project, parts[4]))
@@ -758,7 +1018,7 @@ def main():
         with http.server.ThreadingHTTPServer(("127.0.0.1", args.port), Handler) as service:
             service.app = app
             service.host_header = f"127.0.0.1:{args.port}"
-            print(f"{APP_TITLE} V0.3  {address}", flush=True)
+            print(f"{APP_TITLE} V0.4  {address}", flush=True)
             if not args.no_open:
                 webbrowser.open(address)
             with contextlib.suppress(KeyboardInterrupt):

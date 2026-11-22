@@ -139,7 +139,6 @@ function mvDraftView(project, settings, job) {
         const shot = newShot({name: source.name, prompt: source.action, image_prompt: source.image_prompt});
         shot.seconds = (source.end_ms - source.start_ms) / 1000;
         shot.refs = source.ref_ids;
-        if (source.kind === "performance" && shot.refs.length) shot.mode = "Ref2VA";
         shot.mtv = {track_id: result.track_id, start_ms: source.start_ms, end_ms: source.end_ms, kind: source.kind, cue: source.cue};
         return shot;
       });
